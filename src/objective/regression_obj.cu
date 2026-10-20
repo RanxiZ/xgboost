@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>  // for int32_t
 #include <memory>   // for unique_ptr
+#include <type_traits>  // for is_same_v
 #include <vector>   // for vector
 
 #include "../collective/aggregator.h"
@@ -133,7 +134,16 @@ class RegLossObj : public FitInterceptGlmLike {
   // 0 - scale_pos_weight, 1 - is_null_weight
   RegLossObj() : additional_input_(2) {}
 
-  void Configure(Args const& args) override { param_.UpdateAllowUnknown(args); }
+  void Configure(Args const& args) override {
+    param_.UpdateAllowUnknown(args);
+    if (this->ctx_->IsNPU()) {
+      CHECK((std::is_same_v<Loss, LinearSquareLoss>))
+          << "NPU supports only objective=reg:squarederror; CPU fallback is disabled.";
+      CHECK_EQ(param_.scale_pos_weight, 1.0f)
+          << "NPU squarederror currently requires scale_pos_weight=1; the Newton intercept "
+             "route for other values is not implemented.";
+    }
+  }
 
   [[nodiscard]] ObjInfo Task() const override { return Loss::Info(); }
 
@@ -144,6 +154,9 @@ class RegLossObj : public FitInterceptGlmLike {
 
   void GetGradient(const HostDeviceVector<float>& preds, const MetaInfo& info, std::int32_t iter,
                    linalg::Matrix<GradientPair>* out_gpair) override {
+    CHECK(!this->ctx_->IsNPU())
+        << "NPU gradients require a resident PredictionCacheEntry. Use "
+           "SquareErrorNativeGradient instead of the legacy GetGradient interface.";
     CheckRegInputs(info, preds);
     if (iter == 0) {
       ValidateLabel<Loss>(this->ctx_, info);
@@ -200,6 +213,13 @@ class RegLossObj : public FitInterceptGlmLike {
   [[nodiscard]] const char* DefaultEvalMetric() const override { return Loss::DefaultEvalMetric(); }
 
   void PredTransform(HostDeviceVector<float>* io_preds) const override {
+    if (this->ctx_->IsNPU()) {
+      CHECK((std::is_same_v<Loss, LinearSquareLoss>))
+          << "NPU supports only objective=reg:squarederror.";
+      // Squared error has the identity link. Leave the resident sidecar and host
+      // export exactly as they are; no generic vector/device transform is needed.
+      return;
+    }
     common::Transform<>::Init(
         [] XGBOOST_DEVICE(size_t _idx, common::Span<float> _preds) {
           _preds[_idx] = Loss::PredTransform(_preds[_idx]);
@@ -210,6 +230,25 @@ class RegLossObj : public FitInterceptGlmLike {
   }
 
   void InitEstimation(MetaInfo const& info, linalg::Vector<float>* base_score) const override {
+    if (this->ctx_->IsNPU()) {
+      CHECK((std::is_same_v<Loss, LinearSquareLoss>))
+          << "NPU supports only objective=reg:squarederror.";
+      CHECK_EQ(this->param_.scale_pos_weight, 1.0f)
+          << "NPU squarederror currently requires scale_pos_weight=1; the Newton intercept "
+             "route for other values is not implemented.";
+      CheckInitInputs(info);
+      CHECK_EQ(this->Targets(info), 1) << "NPU supports only scalar labels (num_target=1).";
+      // Initial-intercept estimation is explicit host preprocessing, using the
+      // official mean implementation (including its rejection of all-zero weights).
+      auto host_ctx = this->ctx_->MakeCPU();
+      if (info.weights_.Empty()) {
+        common::SampleMean(&host_ctx, info.labels, base_score);
+      } else {
+        common::WeightedSampleMean(&host_ctx, info.labels, info.weights_, base_score);
+      }
+      CHECK_GE(base_score->Size(), 1);
+      return;
+    }
     if (std::abs(this->param_.scale_pos_weight - 1.0f) > kRtEps) {
       // Use newton method if `scale_pos_weight` is present. The alternative is to use
       // weighted mean, but we also need to take sample weight into account.
@@ -220,6 +259,12 @@ class RegLossObj : public FitInterceptGlmLike {
   }
 
   void ProbToMargin(linalg::Vector<float>* base_score) const override {
+    if (this->ctx_->IsNPU()) {
+      CHECK((std::is_same_v<Loss, LinearSquareLoss>))
+          << "NPU supports only objective=reg:squarederror.";
+      // Identity, including exact preservation of the initial intercept.
+      return;
+    }
     ProbToMarginImpl(
         this->ctx_, base_score, [] XGBOOST_DEVICE(float v) { return Loss::ProbToMargin(v); },
         [] XGBOOST_DEVICE(float v) { return Loss::CheckIntercept(v); }, Loss::InterceptErrorMsg);

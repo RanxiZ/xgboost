@@ -79,6 +79,7 @@ option(__XGBOOST_FOR_PYTHON_WHEEL
   "Building libxgboost embedded inside the Python wheel; skip default installs" OFF)
 ## CUDA
 option(USE_CUDA  "Build with GPU acceleration" OFF)
+option(USE_NPU "Build with native Ascend NPU acceleration (CANN 9.1.0, dav-3510)" OFF)
 option(USE_NCCL  "Build with NCCL to enable distributed GPU support." OFF)
 option(USE_NVCOMP "Build with nvcomp to enable sparse data compression. (experimental)" OFF)
 # This is specifically designed for PyPI binary release and should be disabled for most of the cases.
@@ -118,6 +119,12 @@ option(PLUGIN_SYCL "SYCL plugin" OFF)
 option(ADD_PKGCONFIG "Add xgboost.pc into system." ON)
 
 #-- Checks for building XGBoost
+if(USE_NPU)
+  if(USE_CUDA OR PLUGIN_SYCL OR USE_SYCL)
+    message(FATAL_ERROR "USE_NPU cannot be combined with CUDA or SYCL")
+  endif()
+  include(cmake/NPU.cmake)
+endif()
 if(USE_DEBUG_OUTPUT AND (NOT (CMAKE_BUILD_TYPE MATCHES Debug)))
   message(SEND_ERROR "Do not enable `USE_DEBUG_OUTPUT' with release build.")
 endif()
@@ -440,8 +447,15 @@ endif()
 
 if(KEEP_BUILD_ARTIFACTS_IN_BINARY_DIR)
   set_output_directory(xgboost ${xgboost_BINARY_DIR}/lib)
+elseif(USE_NPU)
+  # An optional NPU build must never overwrite the default CPU Python library.
+  set_output_directory(xgboost ${xgboost_SOURCE_DIR}/lib-npu)
 else()
   set_output_directory(xgboost ${xgboost_SOURCE_DIR}/lib)
+endif()
+if(USE_NPU)
+  target_compile_definitions(xgboost PUBLIC XGBOOST_USE_NPU=1)
+  xgboost_stage_npu_kernel(xgboost)
 endif()
 
 #-- Installing XGBoost

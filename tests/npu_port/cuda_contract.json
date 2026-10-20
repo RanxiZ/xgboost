@@ -1,0 +1,198 @@
+{
+  "schema_version": 1,
+  "reference": {
+    "repository": "https://github.com/dmlc/xgboost",
+    "tag": "v3.4.1",
+    "commit": "6fe8c547bdd21c73e4555d85b087d9260595d30d",
+    "architecture": "official CUDA histogram backend; not the CPU histogram builder"
+  },
+  "validation_scope": {
+    "host_reference": "source-derived contracts and CUDA-shared host-executable definitions",
+    "cuda_execution": "not_run",
+    "npu_execution": "not_run",
+    "full_backend": "not_implemented",
+    "warning": "Source identity and host tests do not establish device parity or device support."
+  },
+  "initial_support": {
+    "supported_target": {
+      "devices": 1,
+      "booster": "gbtree",
+      "tree_method": "hist",
+      "objective": "reg:squarederror",
+      "features": "in-memory dense numeric input with explicit missing values",
+      "targets": 1,
+      "leaf": "scalar",
+      "grow_policy": "depthwise",
+      "sampling_first_checkpoint": "all row and column fractions equal one; fixed cuts",
+      "sampling_qlib_checkpoint": "uniform row sampling and colsample_bytree from frozen effective config"
+    },
+    "deferred": ["categorical", "external_memory", "distributed", "multi_target", "classification", "ranking", "dart", "shap", "monotone_constraints", "interaction_constraints", "gradient_based_sampling", "sparse_input_api", "lossguide"],
+    "policy": "Explicit NPU requests fail on unsupported capability; never silently dispatch dense kernels to CPU."
+  },
+  "numerics": {
+    "integer_dtype": "signed int64 gradient/hessian channels",
+    "quantizer_scale_dtype": "binary64",
+    "scale_construction": "positive/negative channel sums reduced on device; max bound and total rows feed CreateRoundingFactor<double>; floating scale = rounding / 2^62; fixed scale = reciprocal",
+    "conversion": "truncate toward zero; preserve positive source Hessian as integer one if it truncates to zero",
+    "statistics": "integer root, histogram, exclusive scan, missing residual and sibling subtraction; dequantize for gain and weights",
+    "floating_evaluator": "CUDA scalar SplitEvaluator uses float leaf weights and gain values with dequantized statistics; preserve calculation order and test boundary sensitivity",
+    "exact_checks": ["fixed-point values with supplied identical scales", "integer root and histogram", "exclusive prefixes", "missing statistics", "sibling subtraction", "candidate identity for nonambiguous fixtures", "row membership and leaf ids"],
+    "component_float_tolerance": {"absolute": 0.000001, "relative": 0.00001, "scope": "fixed host contract fixtures; provisional device acceptance requires boundary-specific review"},
+    "end_to_end_tolerance": "must be fixed before formal device acceptance using frozen data; not inferred from source-only tests",
+    "determinism": "fixed cuts, masks and feature order isolate arithmetic; identical seed alone does not imply CPU/CUDA/NPU sampling sequence equality",
+    "integer_capability_gate": "Validate int64 accumulation, conversions and scaling on Ascend. Use an independently verified Ascend C implementation if ACLNN cannot satisfy the contract; floating ScatterAdd is not an equivalent substitute."
+  },
+  "components": [
+    {
+      "id": "objective",
+      "source": "src/objective/regression_obj.cu",
+      "anchor": "GetGradient",
+      "npu_component": "squared_error_gradient",
+      "inputs": ["prediction margin", "label", "row weight"],
+      "outputs": ["float gradient and Hessian"],
+      "host": "parameter, label and shape validation; objective setup and initial intercept orchestration",
+      "device": "weighted per-row g=(prediction-label)*weight, h=weight",
+      "synchronization": "gradient generation ordered before quantizer bounds and training; validation summaries only"
+    },
+    {
+      "id": "bins",
+      "source": "src/data/ellpack_page.cuh",
+      "anchor": "thrust::upper_bound",
+      "additional_sources": ["src/data/ellpack_page.cu", "src/common/hist_util.cu"],
+      "npu_component": "binned_dataset",
+      "inputs": ["numeric matrix", "cuts", "missing mask"],
+      "outputs": ["feature offsets", "bin indices", "cut values", "explicit missing sentinel"],
+      "host": "initial cut preparation allowed and reported; matrix metadata",
+      "device": "persistent binned representation; layout adapted to NPU, not a CUDA compression clone",
+      "synchronization": "one-time upload; dataset identity/cut hashes preserved",
+      "rule": "numeric bin uses upper_bound and clamps end to final bin; missing contributes no ordinary feature bin"
+    },
+    {
+      "id": "quantizer",
+      "source": "src/tree/gpu_hist/quantiser.cu",
+      "anchor": "BuildQuantiserFromPair",
+      "additional_sources": ["src/tree/gpu_hist/quantiser.cuh", "src/common/deterministic.cuh"],
+      "npu_component": "gradient_quantizer",
+      "inputs": ["float gradient pairs", "row count"],
+      "outputs": ["binary64 scales", "int64 gradient pairs", "int64 root sum"],
+      "host": "construct scales from small reduced channel bounds, as CUDA does",
+      "device": "positive/negative bounds reduction, gradient conversion, integer root reduction",
+      "synchronization": "small reduced bounds to host and scales to device, not full gradient downloads"
+    },
+    {
+      "id": "sampling",
+      "source": "src/tree/gpu_hist/sampler.cu",
+      "anchor": "Uniform",
+      "additional_sources": ["src/common/random.h", "src/tree/sample_position.h"],
+      "npu_component": "uniform_sampler_and_feature_set",
+      "inputs": ["quantized pairs", "probability", "seed", "feature order"],
+      "outputs": ["sampling mask", "sampled pairs", "selected features"],
+      "host": "column set orchestration permitted; all synchronization declared",
+      "device": "apply row mask and zero sampled-out pairs before histograms",
+      "synchronization": "small feature sets and seeds; no repeated full-row transfers",
+      "rule": "test fixed masks first; prediction updates still cover sampled-out training rows; gradient-based sampling deferred"
+    },
+    {
+      "id": "histogram",
+      "source": "src/tree/gpu_hist/histogram.cu",
+      "anchor": "BuildHistogram",
+      "additional_sources": ["src/tree/gpu_hist/histogram.cuh"],
+      "npu_component": "integer_histogram_builder",
+      "inputs": ["row segments", "bins", "int64 pairs", "feature offsets"],
+      "outputs": ["per-node int64 histogram"],
+      "host": "allocation/cache metadata and construction schedule",
+      "device": "int64 collision accumulation; later parent-minus-child histogram subtraction",
+      "synchronization": "histograms remain on device"
+    },
+    {
+      "id": "split",
+      "source": "src/tree/gpu_hist/evaluate_splits.cu",
+      "anchor": "LossChangeMissing",
+      "additional_sources": ["src/tree/gpu_hist/evaluate_splits.cuh", "src/tree/updater_gpu_common.cuh", "src/tree/split_evaluator.h", "src/tree/param.h"],
+      "npu_component": "split_evaluator",
+      "inputs": ["parent sum", "integer histogram", "cuts", "ordered feature set", "training parameters", "quantizer"],
+      "outputs": ["best feature/cut/default direction", "loss change", "child sums", "leaf weights"],
+      "host": "consume best candidate only; no full candidate scoring on CPU",
+      "device": "exclusive scan, missing=parent-known, both missing directions, regularized scoring and deterministic candidate reduction",
+      "synchronization": "copy compact best-candidate records before host RegTree expansion",
+      "rules": ["equal missing-direction gain chooses right", "DeviceSplitCandidate updates only on strictly greater gain", "first exclusive-scan candidate is negative infinity; later threshold is preceding cut", "subtract parent gain once after reducing child gain", "invalid child Hessian yields negative infinity", "feature reduction keeps left operand on equality; never assume minimum feature id independently of feature order"],
+      "unverified_device_detail": "CUB lane/segment reduction tie ordering must be checked with CUDA fixtures; a generic NPU ArgMax test alone is insufficient"
+    },
+    {
+      "id": "partition",
+      "source": "src/tree/gpu_hist/row_partitioner.cuh",
+      "anchor": "UpdatePositionBatch",
+      "additional_sources": ["src/tree/gpu_hist/row_partitioner.cu", "src/tree/updater_gpu_hist.cu"],
+      "npu_component": "row_partitioner",
+      "inputs": ["row index segments", "selected split", "binned data", "missing mask"],
+      "outputs": ["partitioned row indices", "child counts", "leaf positions"],
+      "host": "node segment metadata and child ranges",
+      "device": "predicate, prefix scan, row scatter and final leaf positions",
+      "synchronization": "child counts to host; full row indices stay resident",
+      "rule": "reconstructed numeric cut <= split threshold for training; missing follows selected default child; test membership separately from physical row order"
+    },
+    {
+      "id": "tree_control",
+      "source": "src/tree/updater_gpu_hist.cu",
+      "anchor": "UpdateTree",
+      "additional_sources": ["src/tree/driver.h", "src/tree/gpu_hist/expand_entry.cuh"],
+      "npu_component": "npu_hist_updater",
+      "inputs": ["device candidate summaries", "training parameters"],
+      "outputs": ["standard RegTree", "next node batch"],
+      "host": "reuse Driver, node expansion, stopping decisions, leaf weights times learning rate and model mutation",
+      "device": "independent compute components driven by updater",
+      "synchronization": "explicit candidate/count synchronization before dependent host decisions",
+      "rule": "gain <= kRtEps rejected; gain < gamma rejected (equality allowed above epsilon); depth/leaf limits enforced by Driver"
+    },
+    {
+      "id": "prediction",
+      "source": "src/predictor/gpu_predictor.cu",
+      "anchor": "PredictFromLeafIds",
+      "additional_sources": ["src/predictor/predict_fn.h", "src/gbm/gbtree.cc"],
+      "npu_component": "tree_predictor_and_cache",
+      "inputs": ["standard tree nodes", "leaf ids or raw features", "base margins", "tree range", "prediction cache"],
+      "outputs": ["updated margins", "batch predictions"],
+      "host": "model serialization, predictor selection and cache version orchestration",
+      "device": "gather leaf contributions for cached training; actual tree traversal for new data",
+      "synchronization": "small model uploads when tree changes; copy final outputs when requested",
+      "rule": "raw numeric feature < split threshold; missing uses default child; cached and uncached predictions must agree including sampled-out rows"
+    },
+    {
+      "id": "native_integration",
+      "source": "src/gbm/gbtree.cc",
+      "anchor": "MapTreeMethodToUpdaters",
+      "additional_sources": ["include/xgboost/context.h", "src/context.cc", "include/xgboost/host_device_vector.h", "src/common/host_device_vector.cc", "src/predictor/predictor.cc", "src/tree/tree_updater.cc", "CMakeLists.txt", "src/CMakeLists.txt"],
+      "npu_component": "context_runtime_buffers_dispatch_build",
+      "inputs": ["device=npu:ordinal", "tree_method=hist", "host DMatrix"],
+      "outputs": ["grow_npu_hist", "npu_predictor", "explicit gradient/metric path"],
+      "host": "device and capability validation, model lifecycle, optional reported host metrics/early stopping",
+      "device": "independent buffer ownership and correctly dispatched numerical operations",
+      "synchronization": "explicit read/write ownership and stream ordering; no CUDA/SYCL buffer masquerading",
+      "rule": "audit all non-CUDA means CPU branches, tensor device spans, empty-cache prediction shortcuts, registration and CPU-only build isolation"
+    }
+  ],
+  "fixed_fixture": {
+    "name": "quantized_histogram_missing_and_empty_bin",
+    "gradients": [-2, 1, 3, 0, -1, 2, 4, 0],
+    "hessians": [1, 1, 2, 0, 1, 3, 2, 0],
+    "bins": [0, 1, 1, 2, -1, 0, 2, -1],
+    "missing_sentinel": -1,
+    "feature_bins": 4,
+    "fixed_scale_each_channel": "288230376151711744",
+    "int64_serialization": "decimal strings avoid JSON consumer loss above 2^53",
+    "expected_root": ["2017612633061982208", "2882303761517117440"],
+    "expected_histogram": [["0", "1152921504606846976"], ["1152921504606846976", "864691128455135232"], ["1152921504606846976", "576460752303423488"], ["0", "0"]],
+    "expected_missing": ["-288230376151711744", "288230376151711744"],
+    "expected_exclusive_prefix": [["0", "0"], ["0", "1152921504606846976"], ["1152921504606846976", "2017612633061982208"], ["2305843009213693952", "2594073385365405696"]]
+  },
+  "acceptance_gates": [
+    "host CUDA-source contracts and pinned-source identity",
+    "native NPU primitives including quantized int64 numerical path",
+    "device component parity against fixed cuts/scales/masks",
+    "CPU-controlled NPU single tree then multiple boosting rounds",
+    "fresh prediction, cache parity, save/load, explicit CPU/NPU selection",
+    "frozen Alpha158 config including nontrivial sampling and early stopping",
+    "reproducible CUDA runtime outputs where compatible NVIDIA environment is available; otherwise explicitly pending",
+    "real component execution evidence and coordinated end-to-end performance measurement"
+  ]
+}

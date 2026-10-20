@@ -20,6 +20,9 @@
 #include "../common/common.h"
 #include "../common/cuda_rt_utils.h"  // for AllVisibleGPUs
 #include "../common/error_msg.h"  // for UnknownDevice, WarnOldSerialization, InplacePredictProxy
+#if defined(XGBOOST_USE_NPU)
+#include "../common/npu/native_prediction.h"
+#endif
 #include "../common/threading_utils.h"
 #include "../common/timer.h"
 #include "../data/proxy_dmatrix.h"  // for DMatrixProxy, HostAdapterDispatch
@@ -43,6 +46,15 @@ DMLC_REGISTRY_FILE_TAG(gbtree);
 namespace {
 /** @brief Map the `tree_method` parameter to the `updater` parameter. */
 std::string MapTreeMethodToUpdaters(Context const* ctx, TreeMethod tree_method) {
+  if (ctx->IsNPU()) {
+    CHECK(tree_method == TreeMethod::kAuto || tree_method == TreeMethod::kHist)
+        << "NPU supports only tree_method=hist (or auto).";
+#if defined(XGBOOST_USE_NPU)
+    return "grow_npu_hist";
+#else
+    LOG(FATAL) << "XGBoost was not compiled with NPU support.";
+#endif
+  }
   // Choose updaters according to tree_method parameters
   if (ctx->IsCUDA()) {
     common::AssertGPUSupport();
@@ -118,6 +130,28 @@ void GBTree::Configure(Args const& cfg) {
   sycl_predictor_->Configure(cfg);
 #endif  // defined(XGBOOST_USE_SYCL)
 
+  if (ctx_->IsNPU()) {
+    CHECK(tparam_.tree_method == TreeMethod::kAuto || tparam_.tree_method == TreeMethod::kHist)
+        << "NPU supports tree_method=hist only.";
+    CHECK(tparam_.process_type == TreeProcessType::kDefault)
+        << "NPU does not support process_type=update.";
+    CHECK_EQ(model_.param.num_parallel_tree, 1) << "NPU supports one tree per iteration.";
+    CHECK(!model_.learner_model_param->IsVectorLeaf());
+    if (model_.learner_model_param->Initialized()) {
+      CHECK_EQ(model_.learner_model_param->OutputLength(), 1);
+    }
+    CHECK(!dparam_.HasDropout() && model_.weight_drop.empty())
+        << "NPU does not support DART/dropout.";
+#if defined(XGBOOST_USE_NPU)
+    if (!npu_predictor_) {
+      npu_predictor_.reset(Predictor::Create("npu_predictor", ctx_));
+    }
+    npu_predictor_->Configure(cfg);
+#else
+    LOG(FATAL) << "XGBoost was not compiled with NPU support.";
+#endif
+  }
+
   // `updater` parameter was manually specified
   specified_updater_ =
       std::any_of(cfg.cbegin(), cfg.cend(), [](auto const& arg) { return arg.first == "updater"; });
@@ -130,6 +164,10 @@ void GBTree::Configure(Args const& cfg) {
     this->tparam_.updater_seq = MapTreeMethodToUpdaters(ctx_, tparam_.tree_method);
   }
 
+  if (ctx_->IsNPU()) {
+    CHECK_EQ(tparam_.updater_seq, "grow_npu_hist")
+        << "NPU execution requires grow_npu_hist; CPU updaters are forbidden.";
+  }
   auto up_names = common::Split(tparam_.updater_seq, ',');
   if (!UpdatersMatched(up_names, updaters_)) {
     updaters_.clear();
@@ -203,6 +241,33 @@ void GPUDartPredictInc(common::Span<float>, common::Span<float>, float, size_t, 
 
 void GBTree::DoBoost(DMatrix* p_fmat, GradientContainer* in_gpair, PredictionCacheEntry* predt,
                      ObjFunction const*) {
+  if (ctx_->IsNPU()) {
+#if defined(XGBOOST_USE_NPU)
+    CHECK(in_gpair->npu_gradient) << "NPU boosting requires resident gradients.";
+    CHECK(predt->npu_predictions) << "NPU boosting requires resident predictions.";
+    CHECK_EQ(in_gpair->npu_gradient->nrows, p_fmat->Info().num_row_);
+    CHECK(in_gpair->gpair.Empty() && !in_gpair->HasValueGrad())
+        << "Host/reduced gradients are unsupported on NPU.";
+    CHECK_EQ(model_.learner_model_param->OutputLength(), 1);
+    CHECK_EQ(model_.param.num_parallel_tree, 1);
+    CHECK_EQ(updaters_.size(), 1);
+    CHECK_EQ(std::string{updaters_.front()->Name()}, "grow_npu_hist");
+    TreesOneGroup ret;
+    std::vector<HostDeviceVector<bst_node_t>> positions;
+    monitor_.Start("BoostNewTrees");
+    BoostNewTrees(in_gpair, p_fmat, 0, &positions, &ret);
+    TreesOneIter trees;
+    trees.push_back(std::move(ret));
+    monitor_.Stop("BoostNewTrees");
+    this->CommitModel(std::move(trees));
+    // The updater never produces host row positions. Traverse only the newly
+    // committed tree on NPU and accumulate into the same resident cache.
+    this->PredictBatchImpl(p_fmat, predt, true, 0, 0, nullptr);
+    return;
+#else
+    LOG(FATAL) << "XGBoost was not compiled with NPU support.";
+#endif
+  }
   if (model_.learner_model_param->IsVectorLeaf()) {
     CHECK(tparam_.tree_method == TreeMethod::kHist || tparam_.tree_method == TreeMethod::kAuto)
         << "Only the hist tree method is supported for building multi-target trees with vector "
@@ -350,7 +415,14 @@ void GBTree::BoostNewTrees(GradientContainer* gpair, DMatrix* p_fmat, int bst_gr
   auto n_out = model_.learner_model_param->OutputLength() * p_fmat->Info().num_row_;
   StringView msg{
       "Mismatching size between number of rows from input data and size of gradient vector."};
-  if (!model_.learner_model_param->IsVectorLeaf() && p_fmat->Info().num_row_ != 0) {
+  if (ctx_->IsNPU()) {
+#if defined(XGBOOST_USE_NPU)
+    CHECK(gpair->npu_gradient);
+    CHECK_EQ(gpair->npu_gradient->nrows, n_out) << msg;
+#else
+    LOG(FATAL) << "XGBoost was not compiled with NPU support.";
+#endif
+  } else if (!model_.learner_model_param->IsVectorLeaf() && p_fmat->Info().num_row_ != 0) {
     CHECK_EQ(n_out % gpair->gpair.Size(), 0) << msg;
   } else if (model_.learner_model_param->IsVectorLeaf()) {
     // vector leaf
@@ -659,6 +731,34 @@ void GBTree::Slice(bst_layer_t begin, bst_layer_t end, bst_layer_t step, Gradien
 void GBTree::PredictBatchImpl(DMatrix* p_fmat, PredictionCacheEntry* out_preds, bool is_training,
                               bst_layer_t layer_begin, bst_layer_t layer_end,
                               std::vector<float> const* tree_weights_override) const {
+  if (ctx_->IsNPU()) {
+#if defined(XGBOOST_USE_NPU)
+    CHECK(tree_weights_override == nullptr && model_.TreeWeights() == nullptr)
+        << "NPU weighted/dropout prediction is unsupported.";
+    auto end = layer_end == 0 ? this->BoostedRounds() : layer_end;
+    CHECK_LE(layer_begin, end);
+    CHECK_LE(end, this->BoostedRounds());
+    auto cacheable = layer_begin == 0;
+    auto reusable = cacheable && out_preds->npu_predictions &&
+                    end >= static_cast<bst_layer_t>(out_preds->version);
+    auto begin = reusable ? static_cast<bst_layer_t>(out_preds->version) : layer_begin;
+    if (!reusable || out_preds->version == 0) {
+      common::npu::InitNativePrediction(ctx_, p_fmat->Info(), out_preds, model_);
+      out_preds->version = 0;
+    }
+    auto [tree_begin, tree_end] = detail::LayerToTree(model_, begin, end);
+    if (tree_begin != tree_end) {
+      npu_predictor_->PredictBatch(p_fmat, out_preds, model_, tree_begin, tree_end);
+    }
+    out_preds->version = cacheable ? end : 0;
+    // Host output is requested only for public predictions/evaluation. Training
+    // uses the resident sidecar exclusively, including the next gradient call.
+    if (!is_training) common::npu::ExportNativePrediction(out_preds);
+    return;
+#else
+    LOG(FATAL) << "XGBoost was not compiled with NPU support.";
+#endif
+  }
   // Unweighted prediction can reuse a cached prefix of the model output by tracking how many
   // boosting iterations have already been accumulated in `out_preds->version`.
   //
@@ -727,6 +827,8 @@ void GBTree::PredictBatch(DMatrix* p_fmat, PredictionCacheEntry* out_preds, bool
 void GBTree::InplacePredict(std::shared_ptr<DMatrix> p_m, float missing,
                             PredictionCacheEntry* out_preds, bst_layer_t layer_begin,
                             bst_layer_t layer_end) const {
+  CHECK(!ctx_->IsNPU())
+      << "NPU inplace prediction is unsupported; use predict with an in-memory DMatrix.";
   auto [tree_begin, tree_end] = detail::LayerToTree(model_, layer_begin, layer_end);
   CHECK_LE(tree_end, model_.trees.size()) << "Invalid number of trees.";
   if (p_m->Ctx()->Device() != this->ctx_->Device()) {
@@ -760,6 +862,16 @@ void GBTree::InplacePredict(std::shared_ptr<DMatrix> p_m, float missing,
 
 [[nodiscard]] std::unique_ptr<Predictor> const& GBTree::GetPredictor(
     bool is_training, HostDeviceVector<float> const* out_pred, DMatrix* f_dmat) const {
+  if (ctx_->IsNPU()) {
+#if defined(XGBOOST_USE_NPU)
+    CHECK(npu_predictor_);
+    CHECK(!f_dmat || f_dmat->SingleColBlock())
+        << "NPU external-memory prediction is unsupported.";
+    return npu_predictor_;
+#else
+    LOG(FATAL) << "XGBoost was not compiled with NPU support.";
+#endif
+  }
   // Data comes from SparsePageDMatrix. Since we are loading data in pages, no need to
   // prevent data copy.
   if (f_dmat && !f_dmat->SingleColBlock()) {

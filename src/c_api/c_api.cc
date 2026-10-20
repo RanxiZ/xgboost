@@ -142,6 +142,11 @@ XGB_DLL int XGBuildInfo(char const **out) {
   info["GIT_HASH"] = String{git_hash};
 #endif
 
+#if defined(XGBOOST_USE_NPU)
+  info["USE_NPU"] = Boolean{true};
+#else
+  info["USE_NPU"] = Boolean{false};
+#endif
   XGBBuildInfoDevice(&info);
 
   auto &out_str = GlobalConfigAPIThreadLocalStore::Get()->ret_str;

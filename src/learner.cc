@@ -58,6 +58,10 @@
 #include "xgboost/string_view.h"          // for operator<<, StringView
 #include "xgboost/task.h"                 // for ObjInfo
 
+#if defined(XGBOOST_USE_NPU)
+#include "common/npu/native_prediction.h"
+#endif
+
 namespace {
 const char* kMaxDeltaStepDefaultValue = "0.7";
 }  // anonymous namespace
@@ -257,7 +261,9 @@ LearnerModelParam::LearnerModelParam(Context const* ctx, LearnerModelParamLegacy
   std::swap(base_score_, base_score);
   // Make sure read access everywhere for thread-safe prediction.
   std::as_const(base_score_).HostView();
-  if (!ctx->IsCPU()) {
+  // NPU kernels consume the intercept as an explicit host scalar, not a generic
+  // HostDeviceVector device view. Keep the scalar available for model IO as well.
+  if (!ctx->IsCPU() && !ctx->IsNPU()) {
     std::as_const(base_score_).View(ctx->Device());
   }
   CHECK(std::as_const(base_score_).Data()->HostCanRead());
@@ -266,7 +272,8 @@ LearnerModelParam::LearnerModelParam(Context const* ctx, LearnerModelParamLegacy
 linalg::VectorView<float const> LearnerModelParam::BaseScore(DeviceOrd device) const {
   // multi-class is not yet supported.
   CHECK_GE(base_score_.Size(), 1) << ModelNotFitted();
-  if (device.IsCPU()) {
+  if (device.IsCPU() || device.IsNPU()) {
+    // NPU native prediction uploads this host scalar explicitly.
     // Make sure that we won't run into race condition.
     CHECK(base_score_.Data()->HostCanRead());
     return base_score_.HostView();
@@ -375,7 +382,8 @@ class Intercept : public Learner {
 
  private:
   void InitEstimation(MetaInfo const& info, linalg::Vector<float>* base_score) {
-    base_score->SetDevice(this->Ctx()->Device());
+    // Intercept estimation is explicit host preprocessing for the native NPU route.
+    base_score->SetDevice(this->Ctx()->IsNPU() ? DeviceOrd::CPU() : this->Ctx()->Device());
     base_score->Reshape(this->mparam_.OutputLength());
     UsePtr(obj_)->InitEstimation(info, base_score);
   }
@@ -394,7 +402,8 @@ class Intercept : public Learner {
   void InitModelParam(LearnerTrainParam const& tparam, bool apply_link) {
     auto const& in = this->mparam_.base_score;
     auto task = UsePtr(this->obj_)->Task();
-    linalg::Vector<float> base_score{in.cbegin(), in.cend(), {in.size()}, this->ctx_.Device()};
+    auto intercept_device = ctx_.IsNPU() ? DeviceOrd::CPU() : ctx_.Device();
+    linalg::Vector<float> base_score{in.cbegin(), in.cend(), {in.size()}, intercept_device};
     if (apply_link) {
       UsePtr(this->obj_)->ProbToMargin(&base_score);
     }
@@ -435,6 +444,9 @@ class Intercept : public Learner {
 
   void InitModelUserParam(LearnerTrainParam const& tparam, CacheT const& cache) {
     this->GetNumTargets(cache);
+    if (ctx_.IsNPU()) {
+      CHECK_EQ(mparam_.num_target, 1) << "NPU supports only num_target=1.";
+    }
 
     if (this->NeedFit()) {
       // Initialize with a sensible default value to get prediction/model io going.
@@ -465,7 +477,12 @@ class Intercept : public Learner {
       // The DMatrix can be null if a method other than training is called.
       if (p_fmat) {
         auto const& info = p_fmat->Info();
-        info.Validate(Ctx()->Device());
+        if (ctx_.IsNPU()) {
+          CHECK_LE(info.labels.Shape(1), 1)
+              << "NPU supports only scalar labels (num_target=1).";
+        }
+        // Metadata validation for the explicit host intercept preprocessing.
+        info.Validate(Ctx()->IsNPU() ? DeviceOrd::CPU() : Ctx()->Device());
         // We estimate it from the input data.
         linalg::Vector<float> base_score;
         this->InitEstimation(info, &base_score);
@@ -505,6 +522,23 @@ class LearnerConfiguration : public Intercept {
   PredictionContainer prediction_container_;
 
   std::vector<std::string> metric_names_;
+  // Metrics are an explicitly permitted host operation for NPU training. Their
+  // context must outlive Metric objects, rather than point at a temporary copy.
+  Context metric_host_ctx_;
+  bool metrics_use_host_ctx_{false};
+
+  Context const* MetricContext() const {
+    return ctx_.IsNPU() ? &metric_host_ctx_ : &ctx_;
+  }
+
+  Metric* CreateMetric(std::string const& name) const {
+    if (ctx_.IsNPU()) {
+      CHECK(name == "rmse" || name == "mae")
+          << "NPU evaluation currently supports only explicit CPU rmse and mae metrics. "
+             "Other metrics have no enabled NPU route.";
+    }
+    return Metric::Create(name, this->MetricContext());
+  }
 
  public:
   explicit LearnerConfiguration(std::vector<std::shared_ptr<DMatrix>> cache)
@@ -515,6 +549,11 @@ class LearnerConfiguration : public Intercept {
         prediction_container_.Cache(d, DeviceOrd::CPU());
       }
     }
+  }
+
+  ~LearnerConfiguration() override {
+    // Base-class metric storage must be released before its host context member.
+    metrics_.clear();
   }
 
   // Configuration before data is known.
@@ -538,6 +577,22 @@ class LearnerConfiguration : public Intercept {
     auto initialized = ctx_.GetInitialised();
     auto old_seed = ctx_.seed;
     ctx_.UpdateAllowUnknown(args);
+    if (ctx_.IsNPU()) {
+      CHECK_EQ(tparam_.objective, "reg:squarederror")
+          << "NPU supports only objective=reg:squarederror; CPU fallback is disabled.";
+      CHECK_EQ(tparam_.booster, "gbtree")
+          << "NPU supports only booster=gbtree (gblinear and dart are unsupported).";
+      CHECK_EQ(mparam_.num_target, 1) << "NPU supports only num_target=1.";
+      for (auto const& entry : prediction_container_.Container()) {
+        CHECK_LE(entry.first.ptr->Info().labels.Shape(1), 1)
+            << "NPU supports only scalar labels (num_target=1).";
+      }
+      CHECK_EQ(mparam_.num_class, 0) << "NPU squarederror does not support num_class.";
+      CHECK(tparam_.multi_strategy == MultiStrategy::kOneOutputPerTree)
+          << "NPU does not support vector-leaf trees or reduced gradients.";
+      CHECK(!collective::IsDistributed()) << "NPU distributed training is not implemented.";
+      metric_host_ctx_ = ctx_.MakeCPU();  // Preserve threads and seed for host metrics.
+    }
 
     ConsoleLogger::Configure(args);
 
@@ -599,6 +654,11 @@ class LearnerConfiguration : public Intercept {
     }
     gbm_->LoadConfig(gradient_booster);
 
+    ctx_.FromJson(learner_parameters.at("generic_param"));
+    if (ctx_.IsNPU()) {
+      metric_host_ctx_ = ctx_.MakeCPU();
+    }
+    metrics_use_host_ctx_ = ctx_.IsNPU();
     auto const& j_metrics = learner_parameters.at("metrics");
     auto n_metrics = get<Array const>(j_metrics).size();
     metric_names_.resize(n_metrics);
@@ -611,13 +671,11 @@ class LearnerConfiguration : public Intercept {
       } else {
         metric_names_[i] = get<String>(j_metrics[i]["name"]);
       }
-      metrics_[i] = std::unique_ptr<Metric>(Metric::Create(metric_names_[i], &ctx_));
+      metrics_[i] = std::unique_ptr<Metric>(this->CreateMetric(metric_names_[i]));
       if (!old_serialization) {
         metrics_[i]->LoadConfig(j_metrics[i]);
       }
     }
-
-    ctx_.FromJson(learner_parameters.at("generic_param"));
 
     this->need_configuration_ = true;
   }
@@ -865,12 +923,23 @@ class LearnerConfiguration : public Intercept {
   }
 
   void ConfigureMetrics(Args const& args) {
+    if (metrics_use_host_ctx_ != ctx_.IsNPU()) {
+      // Device changes must also change the context retained by existing metrics.
+      for (auto& metric : metrics_) {
+        Json config{Object{}};
+        metric->SaveConfig(&config);
+        auto replacement = std::unique_ptr<Metric>{this->CreateMetric(metric->Name())};
+        replacement->LoadConfig(config);
+        metric = std::move(replacement);
+      }
+    }
+    metrics_use_host_ctx_ = ctx_.IsNPU();
     for (auto const& name : metric_names_) {
       auto DupCheck = [&name](std::unique_ptr<Metric> const& m) {
         return m->Name() != name;
       };
       if (std::all_of(metrics_.begin(), metrics_.end(), DupCheck)) {
-        metrics_.emplace_back(std::unique_ptr<Metric>(Metric::Create(name, &ctx_)));
+        metrics_.emplace_back(std::unique_ptr<Metric>(this->CreateMetric(name)));
       }
     }
 
@@ -880,7 +949,8 @@ class LearnerConfiguration : public Intercept {
   }
 
   void InitEstimation(MetaInfo const& info, linalg::Vector<float>* base_score) {
-    base_score->SetDevice(this->Ctx()->Device());
+    // Intercept estimation is explicit host preprocessing for the native NPU route.
+    base_score->SetDevice(this->Ctx()->IsNPU() ? DeviceOrd::CPU() : this->Ctx()->Device());
     base_score->Reshape(this->mparam_.OutputLength());
     UsePtr(obj_)->InitEstimation(info, base_score);
   }
@@ -1109,7 +1179,9 @@ class LearnerImpl : public LearnerIO {
     monitor_.Start("UpdateOneIter");
     TrainingObserver::Instance().Update(iter);
     this->Configure();
+    monitor_.Start("FitIntercept");
     this->FitIntercept(this->tparam_, train.get());
+    monitor_.Stop("FitIntercept");
 
     if (ctx_.seed_per_iteration) {
       ctx_.Rng().seed(ctx_.seed * kRandSeedMagic + this->BoostedRounds());
@@ -1121,13 +1193,33 @@ class LearnerImpl : public LearnerIO {
 
     monitor_.Start("PredictRaw");
     this->PredictRaw(train.get(), predt.get(), true, 0, 0);
-    TrainingObserver::Instance().Observe(predt->predictions, "Predictions");
+    if (!ctx_.IsNPU()) {
+      TrainingObserver::Instance().Observe(predt->predictions, "Predictions");
+    }
     monitor_.Stop("PredictRaw");
 
     monitor_.Start("GetGradient");
-    GetGradient(predt->predictions, train->Info(), iter, &gpair_.gpair);
+    if (ctx_.IsNPU()) {
+#if defined(XGBOOST_USE_NPU)
+      CHECK_EQ(tparam_.objective, "reg:squarederror");
+      Json objective_config{Object{}};
+      obj_->SaveConfig(&objective_config);
+      auto const& reg_param = objective_config["reg_loss_param"];
+      auto scale_pos_weight = std::stof(get<String const>(reg_param["scale_pos_weight"]));
+      // This sidecar is the complete NPU gradient representation. Do not allocate
+      // host gradient pairs or call the legacy objective/observer interfaces.
+      gpair_ = GradientContainer{};
+      gpair_.npu_gradient = common::npu::SquareErrorNativeGradient(
+          &ctx_, predt.get(), train->Info(), iter, scale_pos_weight);
+#else
+      LOG(FATAL) << "XGBoost was not compiled with NPU support.";
+#endif
+    } else {
+      gpair_.npu_gradient.reset();
+      GetGradient(predt->predictions, train->Info(), iter, &gpair_.gpair);
+      TrainingObserver::Instance().Observe(gpair_.Grad()->Data(), "Gradients");
+    }
     monitor_.Stop("GetGradient");
-    TrainingObserver::Instance().Observe(gpair_.Grad()->Data(), "Gradients");
 
     gbm_->DoBoost(train.get(), &gpair_, predt.get(), obj_.get());
     monitor_.Stop("UpdateOneIter");
@@ -1143,6 +1235,22 @@ class LearnerImpl : public LearnerIO {
     }
 
     this->ValidateDMatrix(train.get(), true);
+    if (ctx_.IsNPU()) {
+#if defined(XGBOOST_USE_NPU)
+      CHECK(in_gpair->npu_gradient)
+          << "NPU custom boosting requires native_gradient; host gradient pairs are unsupported.";
+      CHECK(!in_gpair->HasValueGrad() && in_gpair->gpair.Empty())
+          << "NPU custom boosting does not support host or reduced gradients.";
+      CHECK_EQ(in_gpair->npu_gradient->nrows, train->Info().num_row_)
+          << "NPU native_gradient row count must match training data.";
+      auto predt = prediction_container_.Cache(train, ctx_.Device());
+      this->gbm_->DoBoost(train.get(), in_gpair, predt.get(), obj_.get());
+      this->monitor_.Stop(__func__);
+      return;
+#else
+      LOG(FATAL) << "XGBoost was not compiled with NPU support.";
+#endif
+    }
     if (in_gpair->HasValueGrad()) {
       CHECK_EQ(this->learner_model_param_.OutputLength(), in_gpair->NumTargets())
           << "Value gradient should have the same number of targets as the overall model.";
@@ -1166,7 +1274,7 @@ class LearnerImpl : public LearnerIO {
     os.precision(std::numeric_limits<double>::max_digits10);
     os << '[' << iter << ']' << std::setiosflags(std::ios::fixed);
     if (metrics_.empty() && !tparam_.disable_default_eval_metric) {
-      metrics_.emplace_back(Metric::Create(obj_->DefaultEvalMetric(), &ctx_));
+      metrics_.emplace_back(this->CreateMetric(obj_->DefaultEvalMetric()));
       auto config = obj_->DefaultMetricConfig();
       if (!IsA<Null>(config)) {
         metrics_.back()->LoadConfig(config);
@@ -1180,7 +1288,10 @@ class LearnerImpl : public LearnerIO {
       this->ValidateDMatrix(m.get(), false);
       this->PredictRaw(m.get(), predt.get(), false, 0, 0);
 
-      auto& out = output_predictions_.Cache(m, ctx_.Device())->predictions;
+      // NPU prediction was explicitly exported by the non-training prediction
+      // route. Metrics use only this CPU copy and the stable host metric context.
+      auto metric_device = ctx_.IsNPU() ? DeviceOrd::CPU() : ctx_.Device();
+      auto& out = output_predictions_.Cache(m, metric_device)->predictions;
       out.Resize(predt->predictions.Size());
       out.Copy(predt->predictions);
 
@@ -1207,6 +1318,11 @@ class LearnerImpl : public LearnerIO {
     this->CheckModelInitialized();
 
     CHECK_LE(multiple_predictions, 1) << "Perform one kind of prediction at a time.";
+    if (ctx_.IsNPU()) {
+      CHECK_EQ(multiple_predictions, 0)
+          << "NPU supports only value/margin prediction; leaf and contribution prediction "
+             "have no native implementation.";
+    }
     if (pred_contribs) {
       this->ValidateDMatrix(data.get(), false);
       gbm_->PredictContribution(data.get(), out_preds, layer_begin, layer_end, approx_contribs);
@@ -1220,8 +1336,16 @@ class LearnerImpl : public LearnerIO {
     } else {
       auto predt = prediction_container_.Cache(data, ctx_.Device());
       this->PredictRaw(data.get(), predt.get(), training, layer_begin, layer_end);
+#if defined(XGBOOST_USE_NPU)
+      if (ctx_.IsNPU() && training) {
+        // GBTree already exports inference/evaluation predictions. Only the
+        // public training=true prediction needs an additional explicit export;
+        // ordinary training keeps the sidecar resident for the next gradient.
+        common::npu::ExportNativePrediction(predt.get());
+      }
+#endif
       // Copy the prediction cache to output prediction. out_preds comes from C API
-      out_preds->SetDevice(ctx_.Device());
+      out_preds->SetDevice(ctx_.IsNPU() ? DeviceOrd::CPU() : ctx_.Device());
       out_preds->Resize(predt->predictions.Size());
       out_preds->Copy(predt->predictions);
       if (!output_margin) {
@@ -1254,6 +1378,8 @@ class LearnerImpl : public LearnerIO {
     this->Configure();
     this->CheckModelInitialized();
 
+    CHECK(!ctx_.IsNPU())
+        << "NPU inplace prediction is unsupported; use DMatrix prediction for an explicit host export.";
     auto& out_predictions = this->GetThreadLocal().prediction_entry;
     out_predictions.Reset();
 
@@ -1300,7 +1426,12 @@ class LearnerImpl : public LearnerIO {
 
   void ValidateDMatrix(DMatrix* p_fmat, bool is_training) const {
     MetaInfo const& info = p_fmat->Info();
-    info.Validate(ctx_.Device());
+    // MetaInfo and input CSR remain host-owned and are uploaded explicitly by
+    // the native NPU bridge; never request generic NPU metadata/vector views.
+    info.Validate(ctx_.IsNPU() ? DeviceOrd::CPU() : ctx_.Device());
+    if (ctx_.IsNPU()) {
+      CHECK_LE(info.labels.Shape(1), 1) << "NPU supports only scalar labels (num_target=1).";
+    }
 
     if (is_training) {
       CHECK_EQ(learner_model_param_.num_feature, p_fmat->Info().num_col_)

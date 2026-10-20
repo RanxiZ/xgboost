@@ -1,0 +1,56 @@
+{
+  "repository": "https://github.com/NVIDIA/cccl",
+  "tag": "v2.8.2",
+  "commit": "207d20fb6a4165fcd2551bcf2f04b8a5ea40829f",
+  "archive_url": "https://codeload.github.com/NVIDIA/cccl/tar.gz/207d20fb6a4165fcd2551bcf2f04b8a5ea40829f",
+  "archive_sha256": "82f12b9ff47f0c15887cdf90ed0d0f9dab615fa89ffa26d0bf199b039a2a035e",
+  "files": {
+    "cub/cub/thread/thread_operators.cuh": {
+      "url": "https://raw.githubusercontent.com/NVIDIA/cccl/207d20fb6a4165fcd2551bcf2f04b8a5ea40829f/cub/cub/thread/thread_operators.cuh",
+      "sha256": "29ef5e71603c68b21f926f1396e4a3175d12d83a11278042db43b79951828d31"
+    },
+    "cub/cub/warp/warp_reduce.cuh": {
+      "url": "https://raw.githubusercontent.com/NVIDIA/cccl/207d20fb6a4165fcd2551bcf2f04b8a5ea40829f/cub/cub/warp/warp_reduce.cuh",
+      "sha256": "0cefb0f0b4b951ce1bcc4239e001fe5fda81942b404b3d6e8d6b5d73da9cf3b7"
+    },
+    "cub/cub/warp/specializations/warp_reduce_shfl.cuh": {
+      "url": "https://raw.githubusercontent.com/NVIDIA/cccl/207d20fb6a4165fcd2551bcf2f04b8a5ea40829f/cub/cub/warp/specializations/warp_reduce_shfl.cuh",
+      "sha256": "d4b3db062dfe3879eacd59915238b772b6a1e07ea9d67a18449933ba8d14e4d1"
+    },
+    "cub/cub/device/device_segmented_reduce.cuh": {
+      "url": "https://raw.githubusercontent.com/NVIDIA/cccl/207d20fb6a4165fcd2551bcf2f04b8a5ea40829f/cub/cub/device/device_segmented_reduce.cuh",
+      "sha256": "fb882e89d64ccca62c429869410f89f9293beb9a327c99e40b18702c4f686843"
+    },
+    "cub/cub/device/dispatch/dispatch_reduce.cuh": {
+      "url": "https://raw.githubusercontent.com/NVIDIA/cccl/207d20fb6a4165fcd2551bcf2f04b8a5ea40829f/cub/cub/device/dispatch/dispatch_reduce.cuh",
+      "sha256": "66815a5fec15beb0dcb74538455918db724a5d20cbf292bb194b80a18daca48e"
+    },
+    "cub/cub/device/dispatch/tuning/tuning_reduce.cuh": {
+      "url": "https://raw.githubusercontent.com/NVIDIA/cccl/207d20fb6a4165fcd2551bcf2f04b8a5ea40829f/cub/cub/device/dispatch/tuning/tuning_reduce.cuh",
+      "sha256": "89a35825f293cfb43b0c283497381eca3fcb857e269a40bfc05476622644a3f1"
+    },
+    "cub/cub/agent/agent_reduce.cuh": {
+      "url": "https://raw.githubusercontent.com/NVIDIA/cccl/207d20fb6a4165fcd2551bcf2f04b8a5ea40829f/cub/cub/agent/agent_reduce.cuh",
+      "sha256": "326ee290d6dabeed3768f331314b36c23d165d6c07b7bff68cc1d6c51d5a780e"
+    },
+    "cub/cub/block/specializations/block_reduce_warp_reductions.cuh": {
+      "url": "https://raw.githubusercontent.com/NVIDIA/cccl/207d20fb6a4165fcd2551bcf2f04b8a5ea40829f/cub/cub/block/specializations/block_reduce_warp_reductions.cuh",
+      "sha256": "d9fcdfe35341774a595c1c88b3ed49fd7a79fb19d2b29a41a28ca71473f609d3"
+    },
+    "cub/cub/util_arch.cuh": {
+      "url": "https://raw.githubusercontent.com/NVIDIA/cccl/207d20fb6a4165fcd2551bcf2f04b8a5ea40829f/cub/cub/util_arch.cuh",
+      "sha256": "9941bca65b5690e4b9d17b6df038c03af1ce62910017ff980006d32db288b826"
+    }
+  },
+  "supported_contract": "Only official CCCL/CUB v2.8.2 commit above; no equivalence claim for other versions. CUDA source is the repository pinned evaluate_splits.cu, Numerical (32 lanes), strict Update, and left-preserving feature operator+. Nonprimitive DeviceSplitCandidate, default policies.",
+  "warp_order": "warp_reduce.cuh selects shuffle implementation for power-of-two 32. Generic ReduceStep(input, shuffle_down(input, offset)) uses offsets 1,2,4,8,16. ArgMax returns b iff b.value>a.value or (a.value==b.value and b.key<a.key). Induction over each contiguous 2^step range proves lane 0 obtains maximal value and smallest lane key among equal values. Signed zeros compare equal; NaN and +inf are rejected before reduction; -inf is invalid. Strict greater chunk updates preserve earliest winning chunk.",
+  "feature_order": "AgentReduce nonprimitive input disables vectorization. Policy300/350/600 all nominate 256 threads; MemBoundScaling of the 56-byte CUDA DeviceSplitCandidate retains 256 threads (items/thread = 1). Policy1000 has no custom-type tuning and falls back to Policy600. ConsumeTile reads block-striped indices t,t+256,..., preserving earlier stripe entry on equality. BlockReduceWarpReductions reduces each 32-thread warp with offsets 1,2,4,8,16 and lane zero applies warp aggregates 1..7 in order. Thus ties prioritize input position modulo 256, then input position divided by 256; input 256 beats input 1 on a tied maximum. For <=256 features this is ordinary first-input precedence. The implementation follows this metadata traversal, not minimum feature id.",
+  "proof_limits": [
+    "Source-only acquisition and inspection, no CUDA compiler/device execution or empirical CUDA parity.",
+    "No all-CUB-version equivalence claim. Future versions/policies/custom accumulator layouts require review.",
+    "Left-preserving maximum is associative only over the rejected-NaN domain; signed zeros retain winning operand bits.",
+    "NPU correctness-oriented serial vector-core selection; no performance acceptance or native training claim.",
+    "Unselected result uses normalized -inf and UINT32_MAX ids instead of CUDA internal -FLT_MAX/no feature sentinel, while preserving the strict initial > -FLT_MAX comparison (the exact finite -FLT_MAX edge does not create a split).",
+    "Quantization exponent provenance remains caller metadata, as in existing scorer; histogram/runtime ownership is guarded."
+  ]
+}

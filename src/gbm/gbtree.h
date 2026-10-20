@@ -360,6 +360,9 @@ class GBTree : public GradientBooster {
   // Predictors
   std::unique_ptr<Predictor> cpu_predictor_;
   std::unique_ptr<Predictor> gpu_predictor_{nullptr};
+#if defined(XGBOOST_USE_NPU)
+  std::unique_ptr<Predictor> npu_predictor_;
+#endif
 #if defined(XGBOOST_USE_SYCL)
   std::unique_ptr<Predictor> sycl_predictor_;
 #endif  // defined(XGBOOST_USE_SYCL)

@@ -8,12 +8,16 @@
 #include <xgboost/logging.h>
 
 #include <cstddef>  // for size_t
+#include <memory>
+#include <xgboost/npu.h>
 
 namespace xgboost {
 /**
  * @brief Container for gradient produced by objective.
  */
 struct GradientContainer {
+  // NPU gradients have independent ownership; never substitute host gpair data.
+  std::shared_ptr<common::npu::NativeGradient> npu_gradient;
   /** @brief Gradient used for multi-target tree split and linear model. */
   linalg::Matrix<GradientPair> gpair;
   /** @brief Gradient used for tree leaf value, optional. */

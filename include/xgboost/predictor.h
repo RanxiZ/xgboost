@@ -14,6 +14,7 @@
 #include <xgboost/host_device_vector.h>
 #include <xgboost/linalg.h>
 #include <xgboost/span.h>
+#include <xgboost/npu.h>
 
 #include <functional>  // for function
 #include <memory>      // for shared_ptr
@@ -31,6 +32,8 @@ class RegTree;
  * \brief Contains pointer to input matrix and associated cached predictions.
  */
 struct PredictionCacheEntry {
+  // Resident NPU cache; predictions below is an explicit metrics/API export.
+  std::shared_ptr<common::npu::NativePrediction> npu_predictions;
   // A storage for caching prediction values
   HostDeviceVector<float> predictions;
   // The version of current cache, corresponding number of layers of trees
@@ -57,7 +60,7 @@ class PredictionContainer : public DMatrixCache<PredictionCacheEntry> {
   PredictionContainer() : DMatrixCache<PredictionCacheEntry>{DefaultSize()} {}
   std::shared_ptr<PredictionCacheEntry> Cache(std::shared_ptr<DMatrix> m, DeviceOrd device) {
     auto p_cache = this->CacheItem(m);
-    if (!device.IsCPU()) {
+    if (!device.IsCPU() && !device.IsNPU()) {
       p_cache->predictions.SetDevice(device);
     }
     return p_cache;

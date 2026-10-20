@@ -28,6 +28,7 @@ using RandomEngine = std::mt19937;
 struct DeviceSym {
   static auto constexpr CPU() { return "cpu"; }
   static auto constexpr CUDA() { return "cuda"; }
+  static auto constexpr NPU() { return "npu"; }
   static auto constexpr SyclDefault() { return "sycl"; }
   static auto constexpr SyclCPU() { return "sycl:cpu"; }
   static auto constexpr SyclGPU() { return "sycl:gpu"; }
@@ -45,14 +46,17 @@ struct DeviceOrd {
   enum Type : std::int16_t {
     kCPU = 0,
     kCUDA = 1,
+    // Keep the numeric device ABI stable for existing packed views and callers.
     kSyclDefault = 2,
     kSyclCPU = 3,
-    kSyclGPU = 4
+    kSyclGPU = 4,
+    kNPU = 5
   } device{kCPU};
-  // CUDA or Sycl device ordinal.
+  // CUDA, NPU, or SYCL device ordinal.
   bst_d_ordinal_t ordinal{CPUOrdinal()};
 
   [[nodiscard]] bool IsCUDA() const { return device == kCUDA; }
+  [[nodiscard]] bool IsNPU() const { return device == kNPU; }
   [[nodiscard]] bool IsCPU() const { return device == kCPU; }
   [[nodiscard]] bool IsSyclDefault() const { return device == kSyclDefault; }
   [[nodiscard]] bool IsSyclCPU() const { return device == kSyclCPU; }
@@ -78,6 +82,12 @@ struct DeviceOrd {
    */
   [[nodiscard]] static constexpr auto CUDA(bst_d_ordinal_t ordinal) {
     return DeviceOrd{kCUDA, ordinal};
+  }
+  /**
+   * @brief Constructor for Ascend NPU device.
+   */
+  [[nodiscard]] static constexpr auto NPU(bst_d_ordinal_t ordinal) {
+    return DeviceOrd{kNPU, ordinal};
   }
   /**
    * @brief Constructor for SYCL.
@@ -118,6 +128,8 @@ struct DeviceOrd {
         return DeviceSym::CPU();
       case DeviceOrd::kCUDA:
         return DeviceSym::CUDA() + (':' + std::to_string(ordinal));
+      case DeviceOrd::kNPU:
+        return DeviceSym::NPU() + (':' + std::to_string(ordinal));
       case DeviceOrd::kSyclDefault:
         return DeviceSym::SyclDefault() + (':' + std::to_string(ordinal));
       case DeviceOrd::kSyclCPU:
@@ -184,6 +196,10 @@ struct Context : public XGBoostParameter<Context> {
    * @brief Is XGBoost running on a CUDA device?
    */
   [[nodiscard]] bool IsCUDA() const { return Device().IsCUDA(); }
+  /**
+   * @brief Is XGBoost running on an Ascend NPU?
+   */
+  [[nodiscard]] bool IsNPU() const { return Device().IsNPU(); }
   /**
    * @brief Is XGBoost running on the default SYCL device?
    */
@@ -260,6 +276,10 @@ struct Context : public XGBoostParameter<Context> {
         return cpu_fn();
       case DeviceOrd::kCUDA:
         return cuda_fn();
+      case DeviceOrd::kNPU:
+        LOG(FATAL) << "The requested feature has no native NPU implementation. "
+                      "CPU fallback is disabled.";
+        break;
       default:
         // Do not use the device name as this is likely an internal error, the name
         // wouldn't be valid.
