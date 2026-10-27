@@ -4,6 +4,10 @@
 
 #include "certified_scale.h"
 #include "fixed_quantizer.h"
+#include "quantizer_bounds_abi.h"
+#include <algorithm>
+#include <array>
+#include <memory>
 
 namespace xgboost::common::npu {
 struct FittedQuantizedChannel {
@@ -12,6 +16,23 @@ struct FittedQuantizedChannel {
 };
 class DynamicQuantizer {
   Ops& ops_;
+  // Ping-pong bounds summaries (512 buckets + control word) reused across calls:
+  // a fresh tensor would add an allocation, a descriptor build and an extra
+  // stream synchronize on every reduction, all of which are pure host overhead.
+  // The kernel clears the alternate buffer on device, so the host never memsets.
+  std::unique_ptr<Tensor> summaries_[2];
+  std::size_t summary_index_{0};
+  Tensor& BoundsSummary() {
+    if (!summaries_[0]) {
+      for (auto& summary : summaries_) {
+        summary = std::make_unique<Tensor>(ops_.GetRuntime(), quantizer::kBoundsOutputCount,
+                                           ACL_INT64);
+      }
+      // Only the first buffer must start zeroed; each launch clears the other.
+      summaries_[0]->Storage().Zero();
+    }
+    return *summaries_[summary_index_];
+  }
  public:
   explicit DynamicQuantizer(Ops& ops) : ops_{ops} {}
   SignificandBuckets ReduceBounds(Tensor const& input) {
@@ -19,23 +40,26 @@ class DynamicQuantizer {
       throw std::invalid_argument("NPU dynamic quantizer requires 1..INT32_MAX float32 values");
     }
     // Bit decomposition avoids float32 overflow/FTZ and does not require FP64
-    // NPU kernels. Invalid exponents are rejected before scatter is launched.
-    auto bits = ops_.FloatBits(input);
-    auto absolute = ops_.AndBits(bits, INT32_MAX);
-    auto exponent = ops_.Shift(absolute, ops_.Constant(1, 23), false);
-    auto invalid = ops_.Compare(exponent, 255, 0);
-    if (ops_.SumControl(ops_.Cast(invalid, ACL_INT64)) != 0) {
+    // NPU kernels. One SIMT launch performs the whole decomposition: the kernel
+    // keeps exact int64 bucket sums (int32 low word + carry counter in UB) and
+    // reports NaN/Inf through a control word, replacing the twelve-aclnn
+    // FloatBits/AndBits/Shift/Compare/SumControl/Where/Add/ScatterSum chain.
+    constexpr auto kSummaryWords = static_cast<std::size_t>(quantizer::kBoundsOutputCount);
+    Tensor& summary = BoundsSummary();
+    Tensor& next = *summaries_[1 - summary_index_];
+    XgbNpuDynamicQuantizeBounds(ops_.GetRuntime().Stream(), input.Storage().Data(),
+                                static_cast<uint64_t>(input.Count()), summary.Storage().Data(),
+                                next.Storage().Data());
+    std::array<int64_t, kSummaryWords> raw{};
+    ops_.DownloadControl(summary, raw.data(), raw.size());
+    // Swap before any throw: the buffer just consumed holds stale atomics and
+    // must not be reused until a later launch clears it.
+    summary_index_ = 1 - summary_index_;
+    if (raw[static_cast<std::size_t>(quantizer::kBoundsControlIndex)] != 0) {
       throw std::invalid_argument("NPU dynamic quantizer rejects NaN and infinity");
     }
-    auto fraction = ops_.AndBits(absolute, (INT64_C(1) << 23) - 1);
-    auto implicit = ops_.Where(ops_.Compare(exponent, 0, 0), ops_.Constant(1, 0),
-                               ops_.Constant(1, INT64_C(1) << 23));
-    auto mantissa = ops_.Add(fraction, implicit);
-    auto offset = ops_.Where(ops_.Compare(bits, 0, -1), ops_.Constant(1, 256), ops_.Constant(1, 0));
-    auto indices = ops_.Add(exponent, offset);  // exactly [0,254] or [256,510]
-    auto summary = ops_.ScatterSum(indices, mantissa, 512);
-    SignificandBuckets bins{};
-    ops_.DownloadControl(summary, bins.data(), bins.size());
+    SignificandBuckets bins;
+    std::copy_n(raw.begin(), bins.size(), bins.begin());
     return bins;
   }
   FittedQuantizedChannel Convert(Tensor const& input, bool hessian) {

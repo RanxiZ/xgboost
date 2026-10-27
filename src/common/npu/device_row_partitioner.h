@@ -2,7 +2,9 @@
 #ifndef XGBOOST_COMMON_NPU_DEVICE_ROW_PARTITIONER_H_
 #define XGBOOST_COMMON_NPU_DEVICE_ROW_PARTITIONER_H_
 #include "integer_histogram.h"
+#include "row_compact_abi.h"
 #include "row_partition_contract.h"
+#include <cstddef>
 #include <memory>
 #include <utility>
 namespace xgboost::common::npu {
@@ -49,6 +51,59 @@ class DeviceRowPartitioner {
  private:
   Ops& ops_;
   Source source_;
+  // Reused device scratch for the fused SIMT compact: one byte of left flag per
+  // dataset row, the per-warp count array and a generation control word. Pass 1
+  // publishes only the per-warp counts (each warp owns its own word, so the
+  // hand-off to pass 2 is a cross-launch GM read, never an intra-launch one); the
+  // block bases are folded in pass 2 by a warp-cooperative reduction. Allocated
+  // once per partitioner so a node costs two launches plus one small count
+  // download and no temporary tensors beyond the child views.
+  Buffer compact_scratch_;
+  uint32_t compact_generation_{0};
+  struct CompactScratch {
+    char* flags;
+    int32_t* warp_counts;
+    int32_t* control;
+    int32_t* block_counts;       // reserved slot, not written by the current kernels
+    std::size_t summary_offset;  // byte offset of the warp counts inside the scratch
+    std::size_t summary_words;   // warp counts + control words in the summary
+  };
+  static std::size_t AlignUp32(std::size_t bytes) { return (bytes + 31u) & ~std::size_t{31}; }
+  CompactScratch PrepareCompactScratch(int64_t dataset_rows) {
+    constexpr auto kBlocks = rowcompact::kRowCompactBlocks;
+    constexpr auto kWarps = rowcompact::kRowCompactWarps;
+    auto flags_bytes = AlignUp32(static_cast<std::size_t>(dataset_rows));
+    auto warp_bytes = static_cast<std::size_t>(kBlocks) * kWarps * sizeof(int32_t);
+    auto control_bytes = static_cast<std::size_t>(rowcompact::kRowCompactControlWords) *
+                         sizeof(int32_t);
+    auto block_bytes = static_cast<std::size_t>(kBlocks) * sizeof(int32_t);
+    auto total = flags_bytes + warp_bytes + control_bytes + block_bytes;
+    if (!compact_scratch_.Data() || compact_scratch_.Size() < total) {
+      compact_scratch_ = ops_.GetRuntime().Allocate(total);
+      // The control word is read before the first violating launch writes it and
+      // the CUB-style pool recycles dirty blocks: clear it so a stale stamp can
+      // never alias a live generation. One-time cost per (re)allocation.
+      compact_scratch_.Zero();
+      compact_generation_ = 0;
+    }
+    auto* base = static_cast<char*>(compact_scratch_.Data());
+    auto* warp_counts = reinterpret_cast<int32_t*>(base + flags_bytes);
+    auto* control = warp_counts + static_cast<std::ptrdiff_t>(kBlocks) * kWarps;
+    return {base, warp_counts, control, control + rowcompact::kRowCompactControlWords,
+            flags_bytes,
+            static_cast<std::size_t>(kBlocks) * kWarps + rowcompact::kRowCompactControlWords};
+  }
+  // Child row set of the fused compact. base_offset is the arena offset kept in
+  // the row-set metadata; the slice is taken from the arena or from the owned
+  // temporary used by the non-consuming reference path.
+  Rows FusedChild(Tensor const* owned, std::shared_ptr<Arena> const& arena, uint32_t slot,
+                  int64_t base_offset, int64_t slice_offset, int64_t count) {
+    if (count == 0) return Rows{source_, nullptr, 0, arena, base_offset, slot};
+    auto slice = arena ? Tensor::Slice(arena->At(slot), slice_offset, count)
+                       : Tensor::Slice(*owned, slice_offset, count);
+    return Rows{source_, std::make_unique<Tensor>(std::move(slice)), count, arena, base_offset,
+                slot};
+  }
   void CheckSource(Source const& source) const {
     if (!source || source.get() != source_.get()) {
       throw std::invalid_argument("NPU row partition requires identical immutable dataset provenance");
@@ -139,19 +194,55 @@ class DeviceRowPartitioner {
       return {Rows{source_, nullptr, 0, arena, rows.offset_, slot},
               Rows{source_, nullptr, 0, arena, rows.offset_, slot}};
     }
-    auto bins = ops_.Gather(source_->columns[split.feature], *rows.ids_);
-    RejectIf(ops_.Logic(ops_.Compare(bins, -1, -1),
-                        ops_.Compare(bins, source_->bin_counts[split.feature] - 1, 1), false),
-             "NPU row partition bin outside immutable numerical source domain");
-    auto missing = ops_.Compare(bins, -1, 0);
-    auto numerical_left = ops_.Compare(bins, split.candidate, -1);
-    auto left = split.missing_left ? ops_.Logic(missing, numerical_left, false)
-                                  : ops_.Logic(ops_.Not(missing), numerical_left, true);
-    auto count = ops_.SumControl(ops_.Cast(left, ACL_INT64));
+    // Fused SIMT path: pass 1 gathers the split column once, validates the bin
+    // domain and stores the left flag plus per-warp/per-block counts; pass 2
+    // writes both children from that single flag (right position = node position
+    // minus left prefix). No ACLNN operator, host round trip or scratch tensor
+    // sits between the two launches; the only download is the count summary.
+    auto scratch = PrepareCompactScratch(source_->gradient.Count());
+    auto blocks = static_cast<uint32_t>(
+        (rows.count_ + rowcompact::kRowCompactRowsPerBlockTarget - 1) /
+        rowcompact::kRowCompactRowsPerBlockTarget);
+    if (blocks > rowcompact::kRowCompactBlocks) blocks = rowcompact::kRowCompactBlocks;
+    if (++compact_generation_ == 0) ++compact_generation_;  // slot 0 stays unused
+    auto stream = ops_.GetRuntime().Stream();
+    auto* ids = rows.ids_->Storage().Data();
+    XgbNpuRowCompactCount(
+        stream, ids, source_->columns[split.feature].Storage().Data(), rows.count_,
+        source_->bin_counts[split.feature], split.candidate, split.missing_left ? 1U : 0U, blocks,
+        scratch.flags, scratch.warp_counts, scratch.block_counts, scratch.control,
+        compact_generation_);
+    std::unique_ptr<Tensor> owned;
+    void* left_base = nullptr;
+    if (arena) {
+      left_base = static_cast<char*>(arena->At(slot).Storage().Data()) +
+                  rows.offset_ * static_cast<int64_t>(sizeof(int64_t));
+    } else {
+      owned = std::make_unique<Tensor>(ops_.GetRuntime(), rows.count_, ACL_INT64);
+      left_base = owned->Storage().Data();
+    }
+    XgbNpuRowCompactWrite(stream, ids, scratch.flags, scratch.warp_counts,
+                                      scratch.block_counts, rows.count_, blocks, left_base);
+    // One small download carries the per-warp totals (the same words pass 2 folds
+    // into its block bases) and the control word right after them, so the host
+    // count and the device right-child offset agree bit for bit.
+    int32_t summary[rowcompact::kRowCompactBlocks * rowcompact::kRowCompactWarps +
+                    rowcompact::kRowCompactControlWords];
+    compact_scratch_.Download(summary, sizeof(summary), scratch.summary_offset);
+    int64_t count = 0;
+    for (uint32_t i = 0; i < blocks * rowcompact::kRowCompactWarps; ++i) count += summary[i];
+    if (summary[rowcompact::kRowCompactBlocks * rowcompact::kRowCompactWarps +
+                rowcompact::kRowCompactControlViolation] ==
+        static_cast<int32_t>(compact_generation_)) {
+      throw std::invalid_argument("NPU row partition bin outside immutable numerical source domain");
+    }
     if (count < 0 || count > rows.count_) throw std::runtime_error("Invalid NPU child count");
-    return {Compact(*rows.ids_, left, count, arena, rows.offset_, slot),
-            Compact(*rows.ids_, ops_.Not(left), rows.count_ - count, arena,
-                    rows.offset_ + count, slot)};
+    // Arena children are sliced at their absolute arena offset; the owned
+    // reference buffer (non-consuming path) is indexed from zero.
+    auto slice_offset = arena ? rows.offset_ : 0;
+    return {FusedChild(owned.get(), arena, slot, rows.offset_, slice_offset, count),
+            FusedChild(owned.get(), arena, slot, rows.offset_ + count, slice_offset + count,
+                       rows.count_ - count)};
   }
  public:
   // Reference path: repeated partitioning of the same immutable row set is safe.
