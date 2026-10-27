@@ -6,6 +6,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -135,8 +136,10 @@ class NpuHistMaker : public TreeUpdater {
     // those masked values with the already certified original scales. This
     // preserves CUDA's quantized survivors and exact zero sampled-out pairs,
     // while respecting the native pre-quantization float-mask contract.
+    auto quantize_begin = npu::StatsEnabled() ? npu::NowNs() : 0;
     auto g = quantizer.Convert(*native->gradient, false);
     auto h = quantizer.Convert(*native->hessian, true);
+    std::optional<npu::Tensor> gvalues, hvalues;
     if (param->subsample < 1) {
       // GPUHist's UniformSampling consumes exactly one Context RNG value per
       // tree. Keep that driver contract; the device kernel expands it into a
@@ -146,12 +149,15 @@ class NpuHistMaker : public TreeUpdater {
       npu::FixedQuantizer fixed{ops};
       auto sampled_g = fixed.Convert(sampled.gradient, g.certificate.scale, false);
       auto sampled_h = fixed.Convert(sampled.hessian, h.certificate.scale, true);
-      Grow(*param, dmat, trees.front(), ops, std::move(sampled_g.values),
-           std::move(sampled_h.values), g.certificate.scale, h.certificate.scale);
+      gvalues.emplace(std::move(sampled_g.values));
+      hvalues.emplace(std::move(sampled_h.values));
     } else {
-      Grow(*param, dmat, trees.front(), ops, std::move(g.channel.values),
-           std::move(h.channel.values), g.certificate.scale, h.certificate.scale);
+      gvalues.emplace(std::move(g.channel.values));
+      hvalues.emplace(std::move(h.channel.values));
     }
+    if (npu::StatsEnabled()) npu::Stats().quantize_ns += npu::NowNs() - quantize_begin;
+    Grow(*param, dmat, trees.front(), ops, std::move(*gvalues), std::move(*hvalues),
+         g.certificate.scale, h.certificate.scale);
     // Deliberately disable generic CPU leaf-id/prediction-cache paths. The
     // parent gbm commits this standard RegTree and predicts on NPU next round.
     for (auto& position : out_position) position.Resize(0);
@@ -161,6 +167,11 @@ class NpuHistMaker : public TreeUpdater {
   void Grow(TrainParam const& p, DMatrix* dmat, RegTree* tree,
             npu::Ops& ops, npu::Tensor&& gradient, npu::Tensor&& hessian,
             npu::QuantizerScale gscale, npu::QuantizerScale hscale) {
+    // Structural row-id and subset proofs stay on the device and are read back
+    // once per expansion batch (after the split-summary download), not once per
+    // node. The deferred verdicts cannot change device work, only error timing.
+    auto grow_begin = npu::StatsEnabled() ? npu::NowNs() : 0;
+    npu::Ops::DeferScope defer_controls{ops};
     npu::IntegerHistogramBuilder builder{ops, data_.Bins(), std::move(gradient),
                                          std::move(hessian)};
     auto root = builder.BuildRoot();
@@ -266,7 +277,9 @@ class NpuHistMaker : public TreeUpdater {
         }
       }
     }
+    ops.FlushControls();
     ops.GetRuntime().Synchronize();
+    if (npu::StatsEnabled()) npu::Stats().grow_ns += npu::NowNs() - grow_begin;
   }
 };
 }  // namespace

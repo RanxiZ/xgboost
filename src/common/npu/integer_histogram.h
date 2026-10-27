@@ -86,7 +86,14 @@ class IntegerHistogramBuilder {
     }
   }
   void RejectIf(Tensor const& condition, char const* message) {
-    if (ops_.SumControl(ops_.Cast(condition, ACL_INT64)) != 0) throw std::invalid_argument(message);
+    auto violations = ops_.Sum(ops_.Cast(condition, ACL_INT64));
+    if (ops_.DeferringControls()) {
+      ops_.DeferControl(std::move(violations), message);
+      return;
+    }
+    int64_t count = 0;
+    ops_.DownloadControl(violations, &count, 1);
+    if (count != 0) throw std::invalid_argument(message);
   }
   int64_t MagnitudeTotal(Tensor const& values) {
     auto low=ops_.AndBits(values, UINT32_MAX);
@@ -179,21 +186,46 @@ class IntegerHistogramBuilder {
   // nullptr represents an empty node; Tensor itself forbids zero-length data.
   // Nonempty row ids must be unique. Repetition is rejected, not reweighted.
   Histogram Build(Tensor const* row_ids) {
+    auto build_begin = StatsEnabled() ? NowNs() : 0;
     auto n=data_->gradient.Count();
     Tensor packed{ops_.GetRuntime(), HistogramSize(), ACL_INT64};
     auto features = FeatureViews(packed);
     if (!row_ids) {
       auto membership=Zeros(n);
       packed.Storage().Zero();
+      if (StatsEnabled()) Stats().build_ns += NowNs() - build_begin;
       return Histogram{data_,std::move(membership),Zeros(1),Zeros(1),
                        std::move(packed),std::move(features),0};
     }
     CheckVector(*row_ids,row_ids->Count());
     if (row_ids->Count()>n) throw std::invalid_argument("Too many NPU node row ids");
-    RejectIf(ops_.Logic(ops_.Compare(*row_ids,0,-1),ops_.Compare(*row_ids,n-1,1),false),
-             "NPU node row id out of range");
+    // Both structural row-id guards are reduced into one int64 tensor and read
+    // back with a single host wait. The failure path re-inspects each guard so
+    // the original error precedence and messages survive unchanged.
+    auto bad_range=ops_.Cast(
+        ops_.Logic(ops_.Compare(*row_ids,0,-1),ops_.Compare(*row_ids,n-1,1),false),ACL_INT64);
     auto counts=ops_.ScatterSum(*row_ids,ops_.Constant(row_ids->Count(),1),n);
-    RejectIf(ops_.Compare(counts,1,1),"Duplicate NPU node row ids");
+    auto bad_duplicate=ops_.Cast(ops_.Compare(counts,1,1),ACL_INT64);
+    // Each guard covers a different length (node rows vs dataset rows): reduce
+    // both to scalars on device. Under the training updater's deferral scope the
+    // verdicts join the batch-wide control flush; otherwise they are combined
+    // and read back here in one wait, preserving the original error precedence.
+    auto bad_range_sum=ops_.Sum(bad_range);
+    auto bad_duplicate_sum=ops_.Sum(bad_duplicate);
+    if (ops_.DeferringControls()) {
+      ops_.DeferControl(std::move(bad_range_sum),"NPU node row id out of range");
+      ops_.DeferControl(std::move(bad_duplicate_sum),"Duplicate NPU node row ids");
+    } else {
+      auto violations=ops_.Add(bad_range_sum,bad_duplicate_sum);
+      int64_t violation_count=0;
+      ops_.DownloadControl(violations,&violation_count,1);
+      if (violation_count!=0) {
+        int64_t range_violations=0;
+        ops_.DownloadControl(bad_range_sum,&range_violations,1);
+        if (range_violations!=0) throw std::invalid_argument("NPU node row id out of range");
+        throw std::invalid_argument("Duplicate NPU node row ids");
+      }
+    }
     auto g=ops_.Gather(data_->gradient,*row_ids), h=ops_.Gather(data_->hessian,*row_ids);
     auto root_g=ops_.Sum(g), root_h=ops_.Sum(h);
     auto feature_count=data_->columns.size();
@@ -225,12 +257,15 @@ class IntegerHistogramBuilder {
                                 data_->gradient.Storage().Data(), data_->hessian.Storage().Data(),
                                 metadata_device_.Data(), row_count, feature_count_u64);
     ++build_launches_;
-    ops_.GetRuntime().Synchronize();
+    // The histogram stays on the device: split evaluation and sibling
+    // subtraction are enqueued behind this launch on the same stream.
     // Keep exact device membership for the later subtraction precondition.
+    if (StatsEnabled()) { Stats().build_ns += NowNs() - build_begin; ++Stats().n_builds; }
     return Histogram{data_,std::move(counts),std::move(root_g),std::move(root_h),
                      std::move(packed),std::move(features),row_ids->Count()};
   }
   Histogram SubtractSibling(Histogram const& parent, Histogram const& child) {
+    auto subtract_begin = StatsEnabled() ? NowNs() : 0;
     if (parent.source_.get()!=data_.get() || child.source_.get()!=data_.get()) {
       throw std::invalid_argument("NPU histogram subtraction requires identical immutable source and scales");
     }
@@ -243,6 +278,7 @@ class IntegerHistogramBuilder {
     auto features = FeatureViews(packed);
     // The subset proof makes every subtraction the sum over a disjoint sibling,
     // bounded by the previously checked source positive/negative magnitude sums.
+    if (StatsEnabled()) Stats().subtract_ns += NowNs() - subtract_begin;
     return Histogram{data_,std::move(membership),ops_.Add(parent.root_gradient_,child.root_gradient_,-1),
                      ops_.Add(parent.root_hessian_,child.root_hessian_,-1),std::move(packed),
                      std::move(features),parent.rows_-child.rows_};

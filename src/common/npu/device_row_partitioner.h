@@ -186,11 +186,21 @@ class DeviceRowPartitioner {
   }
  private:
   Result PartitionImpl(Rows const& rows, NumericalRowSplit split, bool buffered) {
+    auto partition_begin = StatsEnabled() ? NowNs() : 0;
+    auto partition_wait = StatsEnabled() ? WaitTotalNs() : 0;
+    auto partition_timer = [&] {
+      if (StatsEnabled()) {
+        Stats().partition_ns += NowNs() - partition_begin;
+        Stats().partition_wait_ns += WaitTotalNs() - partition_wait;
+        if (rows.count_) ++Stats().n_partitions;
+      }
+    };
     CheckRows(rows);
     ValidateRowSplit(source_->bin_counts, split);
     auto arena = buffered ? rows.arena_ : nullptr;
     auto slot = buffered ? 1U - rows.slot_ : 0U;
     if (!rows.count_) {
+      partition_timer();
       return {Rows{source_, nullptr, 0, arena, rows.offset_, slot},
               Rows{source_, nullptr, 0, arena, rows.offset_, slot}};
     }
@@ -240,6 +250,7 @@ class DeviceRowPartitioner {
     // Arena children are sliced at their absolute arena offset; the owned
     // reference buffer (non-consuming path) is indexed from zero.
     auto slice_offset = arena ? rows.offset_ : 0;
+    partition_timer();
     return {FusedChild(owned.get(), arena, slot, rows.offset_, slice_offset, count),
             FusedChild(owned.get(), arena, slot, rows.offset_ + count, slice_offset + count,
                        rows.count_ - count)};

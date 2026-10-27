@@ -25,7 +25,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace xgboost::common::npu {
 inline std::size_t ElementBytes(aclDataType type) {
@@ -41,7 +43,11 @@ inline std::size_t ElementBytes(aclDataType type) {
 class Tensor {
   Runtime const* owner_;
   std::shared_ptr<Buffer> storage_;
-  aclTensor* descriptor_{nullptr};
+  // Descriptors are created on first use: histogram metadata and feature views
+  // pass raw storage pointers to the split kernels, so most slices would
+  // otherwise pay an aclCreateTensor/aclDestroyTensor pair per node for a
+  // descriptor that no operator ever consumes.
+  mutable aclTensor* descriptor_{nullptr};
   int64_t count_;
   aclDataType type_;
   static std::size_t Bytes(int64_t count, aclDataType type) {
@@ -54,12 +60,7 @@ class Tensor {
  private:
   Tensor(Runtime const& runtime, int64_t count, aclDataType type, Buffer&& storage)
       : owner_{&runtime}, storage_{std::make_shared<Buffer>(std::move(storage))},
-        count_{count}, type_{type} {
-    int64_t stride = 1;
-    descriptor_ = aclCreateTensor(&count_, 1, type_, &stride, 0, ACL_FORMAT_ND,
-                                  &count_, 1, storage_->Data());
-    if (!descriptor_) throw std::runtime_error("aclCreateTensor failed");
-  }
+        count_{count}, type_{type} {}
  public:
   // Bounded views retain the underlying allocation, including after the parent
   // tensor is destroyed. Runtime and dtype are inherited, never caller supplied.
@@ -76,7 +77,12 @@ class Tensor {
       : Tensor{runtime, count, type, runtime.Allocate(Bytes(count, type))} {}
   ~Tensor() {
     if (descriptor_) {
+      auto begin = StatsEnabled() ? NowNs() : 0;
       auto status = aclDestroyTensor(descriptor_);
+      if (StatsEnabled()) {
+        ++Stats().tensor_destroys;
+        Stats().tensor_destroy_ns += NowNs() - begin;
+      }
       if (status != ACL_SUCCESS) std::cerr << "NPU tensor descriptor cleanup status=" << status << '\n';
     }
   }
@@ -86,7 +92,20 @@ class Tensor {
       : owner_{other.owner_}, storage_{std::move(other.storage_)},
         descriptor_{std::exchange(other.descriptor_, nullptr)}, count_{other.count_}, type_{other.type_} {}
   Tensor& operator=(Tensor&&) = delete;
-  aclTensor* Descriptor() const { return descriptor_; }
+  aclTensor* Descriptor() const {
+    if (!descriptor_) {
+      int64_t stride = 1;
+      auto begin = StatsEnabled() ? NowNs() : 0;
+      descriptor_ = aclCreateTensor(&count_, 1, type_, &stride, 0, ACL_FORMAT_ND,
+                                    &count_, 1, storage_->Data());
+      if (!descriptor_) throw std::runtime_error("aclCreateTensor failed");
+      if (StatsEnabled()) {
+        ++Stats().tensor_creates;
+        Stats().tensor_create_ns += NowNs() - begin;
+      }
+    }
+    return descriptor_;
+  }
   aclDataType Type() const { return type_; }
   int64_t Count() const { return count_; }
   Runtime const* Owner() const { return owner_; }
@@ -104,8 +123,10 @@ class Tensor {
       descriptor_ = aclCreateTensor(&count, 1, type, &stride, 0, ACL_FORMAT_ND, &count, 1,
                                     tensor.Storage().Data());
       if (!descriptor_) throw std::runtime_error("aclCreateTensor view failed");
+      if (StatsEnabled()) ++Stats().view_creates;
     }
     ~View() {
+      if (StatsEnabled()) ++Stats().tensor_destroys;
       if (aclDestroyTensor(descriptor_) != ACL_SUCCESS) std::cerr << "NPU tensor view cleanup failure\n";
     }
     View(View const&) = delete;
@@ -124,12 +145,20 @@ struct IntScalar {
   IntScalar(IntScalar const&) = delete;
   IntScalar& operator=(IntScalar const&) = delete;
 };
-// Synchronous correctness-first operator runner. No CPU numerical fallback.
-// Every workspace is retained through stream synchronization. Async batching and
-// workspace reuse are separate optimizations, not performance claims here.
+// Stream-ordered operator runner. No CPU numerical fallback. All ACLNN calls,
+// custom kernels and copies share one stream, so the runner never waits after a
+// launch: workspaces return to the caching pool and may be reused by later work
+// that the stream orders after every consumer. Host waits happen only where a
+// result is actually read back (Buffer::Download).
 class Ops {
   Runtime const& runtime_;
   std::size_t launches_{0}, control_download_bytes_{0};
+  struct PendingControl {
+    Tensor value;
+    std::string message;
+  };
+  bool defer_controls_{false};
+  std::vector<PendingControl> pending_controls_;
   void Check(Tensor const& a) const {
     if (a.Owner() != &runtime_) throw std::invalid_argument("NPU tensor belongs to a different runtime");
   }
@@ -143,6 +172,50 @@ class Ops {
  public:
   explicit Ops(Runtime const& runtime) : runtime_{runtime} {}
   Runtime const& GetRuntime() const { return runtime_; }
+  // Deferred validation. While enabled, structural checks enqueue their scalar
+  // verdict on the device instead of draining the stream; FlushControls() reads
+  // every pending verdict with one wait. The training updater enables this for
+  // tree growth so an expansion batch shares a single drain; standalone callers
+  // keep immediate error reporting.
+  class DeferScope {
+    Ops& ops_;
+    bool previous_;
+   public:
+    explicit DeferScope(Ops& ops) : ops_{ops}, previous_{ops.DeferringControls()} {
+      ops_.SetDeferControls(true);
+    }
+    ~DeferScope() { ops_.SetDeferControls(previous_); }
+    DeferScope(DeferScope const&) = delete;
+    DeferScope& operator=(DeferScope const&) = delete;
+  };
+  void SetDeferControls(bool enabled) { defer_controls_ = enabled; }
+  bool DeferringControls() const { return defer_controls_; }
+  void DeferControl(Tensor&& scalar, std::string message) {
+    if (scalar.Type() != ACL_INT64 || scalar.Count() != 1) {
+      throw std::invalid_argument("NPU deferred control requires an int64 scalar");
+    }
+    pending_controls_.push_back(PendingControl{std::move(scalar), std::move(message)});
+  }
+  void FlushControls() {
+    if (pending_controls_.empty()) return;
+    if (StatsEnabled()) ++Stats().flush_calls;
+    std::vector<int64_t> values(pending_controls_.size());
+    std::vector<State::CopyRequest> requests;
+    requests.reserve(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      requests.push_back(State::CopyRequest{
+          &values[i], pending_controls_[i].value.Storage().Data(), sizeof(int64_t)});
+    }
+    runtime_.DownloadBatch(requests);
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      if (values[i] != 0) {
+        auto message = pending_controls_[i].message;
+        pending_controls_.clear();
+        throw std::invalid_argument(message);
+      }
+    }
+    pending_controls_.clear();
+  }
   std::size_t Launches() const { return launches_; }
   std::size_t ControlDownloadBytes() const { return control_download_bytes_; }
   template <typename Prepare, typename Execute, typename Cancel = decltype(&aclDestroyAclOpExecutor)>
@@ -151,7 +224,9 @@ class Ops {
     auto stream = static_cast<aclrtStream>(runtime_.Stream());
     uint64_t bytes = 0;
     aclOpExecutor* executor = nullptr;
+    auto begin = StatsEnabled() ? NowNs() : 0;
     CheckAcl(prepare(&bytes, &executor), name);
+    if (StatsEnabled()) Stats().prepare_ns += NowNs() - begin;
     Buffer workspace;
     try {
       if (bytes > std::numeric_limits<std::size_t>::max()) throw std::overflow_error("NPU workspace too large");
@@ -165,9 +240,11 @@ class Ops {
       }
       throw;
     }
+    begin = StatsEnabled() ? NowNs() : 0;
     CheckAcl(execute(workspace.Data(), bytes, executor, stream), name);
+    if (StatsEnabled()) Stats().execute_ns += NowNs() - begin;
     ++launches_;
-    runtime_.Synchronize();
+    if (StatsEnabled()) ++Stats().launches;
     workspace.Release();
   }
 #define XGB_NPU_RUN(op, ...) Run(#op, [&](uint64_t* n, aclOpExecutor** e) { \
@@ -293,12 +370,14 @@ class Ops {
     if (a.Type() != ACL_INT64 || count != static_cast<std::size_t>(a.Count())) {
       throw std::invalid_argument("NPU control download requires a complete int64 summary");
     }
+    if (StatsEnabled()) ++Stats().dl_ops;
     a.Storage().Download(output, count * sizeof(int64_t));
     control_download_bytes_ += count * sizeof(int64_t);
   }
   int64_t SumControl(Tensor const& a) {
     if (a.Type() != ACL_INT64) throw std::invalid_argument("NPU control sum requires int64");
     auto total = Sum(a); int64_t result;
+    if (StatsEnabled()) ++Stats().dl_ops;
     total.Storage().Download(&result, sizeof(result)); control_download_bytes_ += sizeof(result);
     return result;
   }

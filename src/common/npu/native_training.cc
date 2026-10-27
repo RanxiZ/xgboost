@@ -49,6 +49,7 @@ void NativeTrainingData::Bind(Context const* cpu_ctx, DMatrix* dmat, bst_bin_t m
       throw std::invalid_argument("grow_npu_hist does not support categorical features");
     }
   }
+  auto bind_begin = StatsEnabled() ? NowNs() : 0;
   auto page = SinglePage(cpu_ctx, dmat);
   auto const& weights = info.weights_.ConstHostVector();
   // Compare ownership, not addresses: even an allocator reusing a destroyed
@@ -58,9 +59,11 @@ void NativeTrainingData::Bind(Context const* cpu_ctx, DMatrix* dmat, bst_bin_t m
                      !page.owner_before(source_);
   if (same_source && runtime_.get() == runtime.get() && nrows_ == info.num_row_ &&
       nfeatures_ == info.num_col_ && max_bin_ == max_bin && sketch_weights_ == weights) {
+    if (StatsEnabled()) Stats().bind_ns += NowNs() - bind_begin;
     return;
   }
 
+  auto sketch_begin = StatsEnabled() ? NowNs() : 0;
   auto cuts = common::SketchOnDMatrix(cpu_ctx, dmat, max_bin);
   if (cuts.HasCategorical()) throw std::invalid_argument("NPU categorical cuts unsupported");
   auto ptrs = cuts.Ptrs();
@@ -82,20 +85,33 @@ void NativeTrainingData::Bind(Context const* cpu_ctx, DMatrix* dmat, bst_bin_t m
     }
   }
 
+  if (StatsEnabled()) Stats().bind_sketch_ns += NowNs() - sketch_begin;
+  auto layout_begin = StatsEnabled() ? NowNs() : 0;
   auto view = page->GetView();
   std::vector<uint64_t> offsets(static_cast<size_t>(info.num_row_) + 1, 0);
   std::vector<native_abi::Entry> entries;
   entries.reserve(page->data.Size());
+  // Per-row duplicate detection with an epoch stamp instead of a per-row
+  // std::set: dense Alpha158 rows would otherwise build and tear down a
+  // red-black tree for every row of the dataset during binding.
+  std::vector<uint32_t> seen(static_cast<std::size_t>(info.num_col_), 0);
+  uint32_t epoch = 0;
   for (size_t row = 0; row < view.Size(); ++row) {
-    std::set<bst_feature_t> seen;
+    if (++epoch == 0) {
+      std::fill(seen.begin(), seen.end(), 0);
+      epoch = 1;
+    }
     for (auto const& e : view[row]) {
-      if (e.index >= info.num_col_ || !seen.insert(e.index).second || std::isinf(e.fvalue)) {
+      if (e.index >= info.num_col_ || seen[e.index] == epoch || std::isinf(e.fvalue)) {
         throw std::invalid_argument("NPU CSR feature is duplicated, out of range or infinite");
       }
+      seen[e.index] = epoch;
       entries.push_back({e.index, e.fvalue});
     }
     offsets[row + 1] = entries.size();
   }
+  if (StatsEnabled()) Stats().bind_layout_ns += NowNs() - layout_begin;
+  auto upload_begin = StatsEnabled() ? NowNs() : 0;
   auto d_offsets = runtime->AllocateElements<uint64_t>(offsets.size());
   auto d_entries = runtime->Allocate(std::max<size_t>(1, entries.size() * sizeof(native_abi::Entry)));
   auto d_ptrs = runtime->AllocateElements<uint32_t>(ptrs.size());
@@ -116,16 +132,20 @@ void NativeTrainingData::Bind(Context const* cpu_ctx, DMatrix* dmat, bst_bin_t m
   XgbNpuNativeBinRows(runtime->Stream(), d_offsets.Data(), d_entries.Data(), d_ptrs.Data(),
                       d_cuts.Data(), d_columns.Data(), info.num_row_, info.num_col_);
   runtime->Synchronize();
+  if (StatsEnabled()) Stats().bind_upload_ns += NowNs() - upload_begin;
 
   // Validate bin ranges before publication. All later builders share this
   // opaque storage without a per-tree device copy or repeated column scan.
+  auto validate_begin = StatsEnabled() ? NowNs() : 0;
   auto bins = IntegerHistogramBuilder::BindBins(*ops, std::move(columns), counts);
+  if (StatsEnabled()) Stats().bind_validate_ns += NowNs() - validate_begin;
   bins_.reset();
   ops_ = std::move(ops); runtime_ = std::move(runtime);
   bins_ = std::move(bins);
   cut_ptrs_ = std::move(ptrs); cuts_ = std::move(values); bin_counts_ = std::move(counts);
   source_ = page; nrows_ = info.num_row_; nfeatures_ = info.num_col_; max_bin_ = max_bin;
   sketch_weights_ = weights;
+  if (StatsEnabled()) Stats().bind_ns += NowNs() - bind_begin;
 }
 
 float NativeTrainingData::Threshold(uint32_t feature, uint32_t candidate) const {
@@ -156,7 +176,9 @@ SampledNativeGradient SampleNativeGradient(NativeGradient const& input, float su
   XgbNpuNativeSampleRows(input.runtime->Stream(), input.gradient->Storage().Data(),
                          input.hessian->Storage().Data(), out.gradient.Storage().Data(),
                          out.hessian.Storage().Data(), input.nrows, seed, subsample);
-  input.runtime->Synchronize();
+  // The sampled channels are consumed by stream-ordered quantization; the
+  // caller reads no device result here, so the former full drain only
+  // serialized the host against the device once per tree.
   return out;
 }
 }  // namespace xgboost::common::npu

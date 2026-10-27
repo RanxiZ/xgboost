@@ -49,7 +49,16 @@ class NumericalSplitEvaluator {
     return EvaluateBatch({Request{&histogram, p, feature_order}}).front();
   }
   std::vector<precise::SplitSummary> EvaluateBatch(std::vector<Request> const& requests) {
+    auto evaluate_begin = StatsEnabled() ? NowNs() : 0;
+    auto evaluate_wait = StatsEnabled() ? WaitTotalNs() : 0;
     if (requests.empty()) return {};
+    auto evaluate_timer = [&] {
+      if (StatsEnabled()) {
+        Stats().evaluate_ns += NowNs() - evaluate_begin;
+        Stats().evaluate_wait_ns += WaitTotalNs() - evaluate_wait;
+        ++Stats().n_eval;
+      }
+    };
     auto const& r = ops_.GetRuntime();
     std::vector<Prepared> prepared;
     prepared.reserve(requests.size());
@@ -141,9 +150,14 @@ class NumericalSplitEvaluator {
                               base + i * sizeof(precise::SplitSummary)); ++launches_;
     }
     summary.Download(out.data(), summary_bytes); control_download_bytes_ += summary_bytes;
+    // The summary drain already retired every producer enqueued before it, so
+    // deferred structural verdicts from this expansion batch cost one extra
+    // staged event wait on an otherwise idle stream.
+    ops_.FlushControls();
     for (auto const& result : out) {
       if (result.error) throw std::overflow_error("NPU evaluator outside supported arithmetic domain or incomplete batch");
     }
+    evaluate_timer();
     return out;
   }
 };

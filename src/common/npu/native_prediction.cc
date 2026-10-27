@@ -198,7 +198,9 @@ void FlattenModel(NativePrediction* state, gbm::GBTreeModel const& model) {
   else nodes_device->Zero();
   if (tree_bytes) trees_device->Upload(trees.data(), tree_bytes);
   else trees_device->Zero();
-  state->runtime->Synchronize();
+  // The uploads are stream-ordered ahead of every prediction kernel that uses
+  // them, and asynchronous uploads copy the host bytes into pinned staging
+  // before returning, so no host wait is required here.
   state->nodes = std::move(nodes);
   state->trees = std::move(trees);
   state->nodes_device = std::move(nodes_device);
@@ -263,6 +265,11 @@ std::shared_ptr<NativePrediction> MakeState(Context const* ctx, MetaInfo const& 
 }
 
 void UploadRows(NativePrediction* state, DMatrix* dmat) {
+  auto timer_begin = StatsEnabled() ? NowNs() : 0;
+  struct Timer {
+    std::uint64_t begin;
+    ~Timer() { if (StatsEnabled()) Stats().upload_rows_ns += NowNs() - begin; }
+  } timer{timer_begin};
   if (!dmat || dmat->Info().num_row_ != state->nrows) {
     throw std::invalid_argument("NPU DMatrix row count changed for prediction cache");
   }
@@ -454,6 +461,7 @@ void PredictNative(Context const* ctx, DMatrix* dmat, PredictionCacheEntry* cach
     throw std::invalid_argument("NPU prediction cache/input is not initialized");
   }
   auto state = cache->npu_predictions;
+  auto timer_begin = StatsEnabled() ? NowNs() : 0;
   CheckState(ctx, *state);
   CheckPredictionValid(*state);
   CheckModel(ctx, dmat->Info(), model);
@@ -466,7 +474,10 @@ void PredictNative(Context const* ctx, DMatrix* dmat, PredictionCacheEntry* cach
     throw std::invalid_argument("NPU DMatrix row count changed for prediction cache");
   }
   ClearStatus(state.get());
-  if (state->nrows == 0 || begin == tree_end) return;
+  if (state->nrows == 0 || begin == tree_end) {
+    if (StatsEnabled()) Stats().predict_ns += NowNs() - timer_begin;
+    return;
+  }
   auto const* data_ctx = dmat->Ctx();
   if (!data_ctx || (!data_ctx->Device().IsCPU() && data_ctx->Device() != ctx->Device())) {
     throw std::invalid_argument("NPU prediction input belongs to an incompatible device context");
@@ -485,7 +496,8 @@ void PredictNative(Context const* ctx, DMatrix* dmat, PredictionCacheEntry* cach
       state->offsets->Data(), state->entries->Data(), state->predictions->Storage().Data(),
       state->prediction_scratch->Storage().Data(), state->status->Data(),
       state->nrows, state->ngroups, state->uploaded_tree_count, begin, tree_end);
-  state->runtime->Synchronize();
+  // The status download is ordered behind the prediction kernel and waits for
+  // exactly that copy, so the former explicit stream drain is redundant.
   native_abi::Status result{};
   state->status->Download(&result, sizeof(result));
   if (result.error) {
@@ -519,6 +531,7 @@ void PredictNative(Context const* ctx, DMatrix* dmat, PredictionCacheEntry* cach
   state->predictions.swap(state->prediction_scratch);
   state->prediction_valid = true;
   ++state->prediction_launches;
+  if (StatsEnabled()) Stats().predict_ns += NowNs() - timer_begin;
 }
 
 void ExportNativePrediction(PredictionCacheEntry* cache) {
@@ -526,6 +539,7 @@ void ExportNativePrediction(PredictionCacheEntry* cache) {
     throw std::invalid_argument("NPU prediction cache is not initialized");
   }
   auto const& state = *cache->npu_predictions;
+  auto timer_begin = StatsEnabled() ? NowNs() : 0;
   CheckPredictionValid(state);
   if (!state.runtime || !state.ops || &state.ops->GetRuntime() != state.runtime.get() ||
       (state.nrows && (!state.predictions || state.predictions->Owner() != state.runtime.get() ||
@@ -533,11 +547,11 @@ void ExportNativePrediction(PredictionCacheEntry* cache) {
                       state.predictions->Count() != static_cast<int64_t>(state.nrows) * state.ngroups))) {
     throw std::invalid_argument("NPU prediction export has incomplete device state");
   }
-  state.runtime->Synchronize();
   cache->predictions.Resize(static_cast<std::size_t>(state.nrows) * state.ngroups);
   if (state.nrows == 0) return;
   auto& host = cache->predictions.HostVector();
   state.predictions->Storage().Download(host.data(), host.size() * sizeof(float));
+  if (StatsEnabled()) Stats().export_ns += NowNs() - timer_begin;
 }
 
 std::shared_ptr<NativeGradient> SquareErrorNativeGradient(
@@ -551,6 +565,7 @@ std::shared_ptr<NativeGradient> SquareErrorNativeGradient(
     throw std::invalid_argument("NPU scale_pos_weight must be finite and nonnegative");
   }
   auto state = cache->npu_predictions;
+  auto timer_begin = StatsEnabled() ? NowNs() : 0;
   CheckState(ctx, *state);
   CheckPredictionValid(*state);
   CheckNumericFeatures(info);
@@ -583,11 +598,11 @@ std::shared_ptr<NativeGradient> SquareErrorNativeGradient(
       result->labels->Storage().Data(), result->weights ? result->weights->Storage().Data() : nullptr,
       result->gradient->Storage().Data(), result->hessian->Storage().Data(), state->status->Data(),
       result->nrows, scale_pos_weight);
-  state->runtime->Synchronize();
   native_abi::Status status{};
   state->status->Download(&status, sizeof(status));
   if (status.error) throw std::overflow_error("NPU square-error arithmetic produced a nonfinite result");
   ++state->gradient_launches;
+  if (StatsEnabled()) Stats().gradient_ns += NowNs() - timer_begin;
   return result;
 }
 
